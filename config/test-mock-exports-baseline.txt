@@ -2350,7 +2350,6 @@
 ["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","../sandbox.js","a052ff05d2a9f014c85e952e2e784737ca9bb573a5d03e908c7181352d6f5c28",1]
 ["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","./compaction-runtime-context.js","b35666dcec13faf00bade907486f45771e7d2f55d009b8e54fb7880afe783705",1]
 ["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","./compaction-runtime-preparation.js","8b417a2a52c55c07e2af4b38ae1a59ccb4e73332d2479fd51ef5acb582d4e29c",1]
-["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","./logger.js","6d58f9919507b32de63cd2c3d0d5ae2a44d8b21a5da964653f0e74bb7dd754b2",1]
 ["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","./model.js","556c4abd6fb02e27939bb617a4a98f4b97623550fd6d1665fc51610669216258",1]
 ["src/agents/embedded-agent-runner/model-resolution-consistency.test.ts","./run/setup.js","e62e4ccafb20ded6229e9e26c525852e166483625ba0b07882bfb3064acaa402",1]
 ["src/agents/embedded-agent-runner/model.forward-compat.errors-and-overrides.test.ts","../../plugins/provider-runtime.js","eee810fbf26d55aa6645b4cd0732059e33b417fa11bc3ce1d2565fd140a260b4",1]
