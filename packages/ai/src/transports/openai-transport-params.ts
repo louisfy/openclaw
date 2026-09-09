@@ -15,6 +15,7 @@ import {
   usesNativeOpenAICodexResponsesBackend,
 } from "./openai-completions-compat.js";
 import { resolveOpenAIReasoningEffortMap } from "./openai-reasoning-compat.js";
+import { OPENAI_RESPONSES_APIS } from "./openai-responses-contracts.js";
 import type { OpenAIModeModel } from "./openai-transport-shared.js";
 import { resolveOpencodeSessionHeaders } from "./session-affinity.js";
 import { isCodeModeModelVisibleToolName, sha256Hex } from "./transport-utils.js";
@@ -320,9 +321,7 @@ export function buildOpenAIClientHeaders(
   }).headers;
   const resolvedHeaders = headers ?? {};
   const configuredSessionHeaderPolicy =
-    (model.api === "openai-responses" || model.api === "openai-chatgpt-responses") &&
-    model.compat &&
-    "sendSessionIdHeader" in model.compat
+    OPENAI_RESPONSES_APIS.has(model.api) && model.compat && "sendSessionIdHeader" in model.compat
       ? model.compat?.sendSessionIdHeader
       : undefined;
   const sendSessionIdHeader =

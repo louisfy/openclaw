@@ -1,11 +1,38 @@
+import type {
+  AssistantMessageEventStreamContract,
+  AssistantMessageEventStreamLike,
+  StreamFn,
+} from "@openclaw/llm-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createApiRegistry } from "../api-registry.js";
 import { configureAiTransportHost, getAiTransportHost } from "../host.js";
 import { streamSimpleGoogle } from "../providers/google.js";
 import type { Model } from "../types.js";
 import { createOpenAIResponsesTransportStreamFn } from "./openai-responses-client.js";
 import { createBoundaryAwareStreamFnForModel } from "./provider-transport-stream.js";
+import { prepareModelForSimpleCompletion } from "./simple-completion-transport.js";
 
 const initialHost = getAiTransportHost();
+
+function isSynchronousStream(
+  stream: AssistantMessageEventStreamLike,
+): stream is AssistantMessageEventStreamContract {
+  return (
+    "push" in stream &&
+    typeof stream.push === "function" &&
+    "end" in stream &&
+    typeof stream.end === "function"
+  );
+}
+
+function requireSynchronousStream(
+  stream: ReturnType<StreamFn>,
+): AssistantMessageEventStreamContract {
+  if (stream instanceof Promise || !isSynchronousStream(stream)) {
+    throw new Error("Expected synchronous assistant event stream");
+  }
+  return stream;
+}
 
 afterEach(() => {
   configureAiTransportHost(initialHost);
@@ -138,6 +165,85 @@ describe("managed OpenAI Responses session headers at fetch egress", () => {
         sessionId: "conversation-a",
         cacheRetention: testCase.cacheRetention,
       },
+    );
+    await stream.result();
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.headers.get("session_id")).toBe(testCase.expected);
+  });
+
+  it.each([
+    {
+      name: "proxy opt-in",
+      baseUrl: "https://responses-proxy.example.test/openai",
+      sendSessionIdHeader: true,
+      expected: "conversation-a",
+    },
+    {
+      name: "native opt-out",
+      baseUrl: "https://chatgpt.com/backend-api",
+      sendSessionIdHeader: false,
+      expected: null,
+    },
+  ] as const)("preserves $name through prepared simple-completion dispatch", async (testCase) => {
+    const requests: Request[] = [];
+    const captureFetch: typeof fetch = async (input, init) => {
+      requests.push(new Request(input, init));
+      return new Response(JSON.stringify({ error: { message: "request captured" } }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    configureAiTransportHost({
+      ...initialHost,
+      buildModelFetch: () => captureFetch,
+      plugin: { ...initialHost.plugin, resolveProviderStream: () => undefined },
+      registerCustomApi: (registry, api, streamFn) => {
+        if (registry.getApiProvider(api)) {
+          return false;
+        }
+        const registeredStream = (
+          model: Model,
+          context: Parameters<StreamFn>[1],
+          options?: Parameters<StreamFn>[2],
+        ) => requireSynchronousStream(streamFn(model, context, options));
+        registry.registerApiProvider({
+          api,
+          stream: registeredStream,
+          streamSimple: registeredStream,
+        });
+        return true;
+      },
+    });
+
+    const apiRegistry = createApiRegistry();
+    const sourceModel = {
+      id: "gpt-5.5",
+      name: "GPT-5.5",
+      api: "openai-chatgpt-responses",
+      provider: "openai",
+      baseUrl: testCase.baseUrl,
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 128,
+      compat: { sendSessionIdHeader: testCase.sendSessionIdHeader },
+    } as Model;
+    const model = prepareModelForSimpleCompletion({
+      apiRegistry,
+      model: sourceModel,
+    });
+    expect(model.api).toBe("openclaw-openai-chatgpt-responses-transport");
+    const provider = apiRegistry.getApiProvider(model.api);
+    if (!provider) {
+      throw new Error(`No provider registered for ${model.api}`);
+    }
+
+    const stream = provider.streamSimple(
+      model,
+      { messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+      { apiKey: "test-key", sessionId: "conversation-a", cacheRetention: "short" },
     );
     await stream.result();
 
