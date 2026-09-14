@@ -21,10 +21,14 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function loginHarness() {
+function loginHarness(harnessOptions: { expiredXai?: boolean } = {}) {
   const harness = createHarness("writer");
   const { context, request } = harness;
   const originalRequest = request.getMockImplementation()!;
+  const provider = harnessOptions.expiredXai ? "xai" : "example";
+  const displayName = harnessOptions.expiredXai ? "xAI" : "Example provider";
+  const secretChoice = harnessOptions.expiredXai ? "xai/xai-api-key" : "example-secret";
+  const browserChoice = harnessOptions.expiredXai ? "xai/xai-oauth" : "example-browser";
   let saved = false;
   let stepShown = false;
   const answer = deferred<WizardNextResult>();
@@ -35,33 +39,48 @@ function loginHarness() {
     providers: saved
       ? [
           {
-            provider: "example",
-            displayName: "Example provider",
+            provider,
+            displayName,
             status: "ok",
-            profiles: [{ profileId: "example:new", type: "api_key", status: "ok" }],
+            profiles: [
+              {
+                profileId: `${provider}:new`,
+                type: harnessOptions.expiredXai ? "oauth" : "api_key",
+                status: "ok",
+              },
+            ],
           },
         ]
-      : [],
+      : harnessOptions.expiredXai
+        ? [
+            {
+              provider,
+              displayName,
+              status: "expired",
+              profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired" }],
+            },
+          ]
+        : [],
     providerCapabilities: [
       {
-        provider: "example",
+        provider,
         apiKeySupported: true,
         quickApiKeySetup: true,
         loginOptions: [
           {
-            id: "example-secret",
-            brandId: "example",
-            label: "Example API key",
-            groupLabel: "Example provider",
-            hint: "Use your Example account key",
+            id: secretChoice,
+            brandId: provider,
+            label: harnessOptions.expiredXai ? "xAI API key" : "Example API key",
+            groupLabel: displayName,
+            hint: `Use your ${displayName} account key`,
             kind: "secret",
             featured: false,
           },
           {
-            id: "example-browser",
-            brandId: "example",
-            label: "Example browser sign-in",
-            kind: "oauth",
+            id: browserChoice,
+            brandId: provider,
+            label: harnessOptions.expiredXai ? "xAI OAuth" : "Example browser sign-in",
+            kind: harnessOptions.expiredXai ? "device-code" : "oauth",
             featured: true,
           },
         ],
@@ -131,6 +150,32 @@ async function submitCredential(page: ModelProvidersPageTestElement) {
 }
 
 describe("Models provider login", () => {
+  it("starts the sole browser sign-in when reconnecting an expired xAI OAuth profile", async () => {
+    const { context, request } = loginHarness({ expiredXai: true });
+    const page = appendPage(context);
+    await waitForFast(() =>
+      expect(
+        page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect"),
+      ).not.toBeNull(),
+    );
+
+    page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect")!.click();
+
+    await waitForFast(() =>
+      expect(page.querySelector<HTMLInputElement>('input[name="wizard-text"]')).not.toBeNull(),
+    );
+    expect(request).toHaveBeenCalledWith(
+      "models.authLogin",
+      {
+        authChoice: "xai/xai-oauth",
+        agentId: "writer",
+        sessionId: expect.any(String),
+      },
+      { timeoutMs: null },
+    );
+    expect(page.querySelector("[data-models-login-choice]")).toBeNull();
+  });
+
   it("saves credentials through the selected manifest choice and refreshes the provider card", async () => {
     const { context, request, runtimeConfig, answer } = loginHarness();
     const page = appendPage(context);

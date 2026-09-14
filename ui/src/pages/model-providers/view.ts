@@ -113,7 +113,9 @@ type ModelProvidersViewProps = {
   onCatalogRetry: () => void;
   onOpenModelSetup: () => void;
   onConnect: (card: ModelProviderCard) => void;
+  onReconnect: (card: ModelProviderCard, provider: string) => void;
   canConnect: (card: ModelProviderCard) => boolean;
+  canReconnect: (card: ModelProviderCard, provider: string) => boolean;
   loginBusy: boolean;
 };
 
@@ -401,6 +403,9 @@ function renderProviderRow(card: ModelProviderCard, props: ModelProvidersViewPro
               profileOrders: props.profileOrders,
               onAddAccount: props.canConnect(card) ? () => props.onConnect(card) : undefined,
               addAccountDisabled: props.loginBusy || configMutationDisabled(props),
+              onReconnect: (provider) => props.onReconnect(card, provider),
+              canReconnect: (provider) => props.canReconnect(card, provider),
+              reconnectDisabled: props.loginBusy || configMutationDisabled(props),
               onProfileOrderChange: props.onProfileOrderChange,
               onRequestLogout: props.onRequestLogout,
             })

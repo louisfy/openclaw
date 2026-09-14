@@ -71,8 +71,11 @@ export class ModelProviderLoginController implements ReactiveController {
       canMutate: this.options.canStart(),
       loginBusy: this.busy,
       onConnect: (card: ModelProviderCard) => this.open([card.id, ...card.credentialProviderIds]),
+      onReconnect: (_card: ModelProviderCard, provider: string) => this.reconnect(provider),
       canConnect: (card: ModelProviderCard) =>
         this.loginOptions([card.id, ...card.credentialProviderIds]).length > 0,
+      canReconnect: (_card: ModelProviderCard, provider: string) =>
+        this.reconnectOptions(provider).length === 1,
     };
   }
 
@@ -97,6 +100,36 @@ export class ModelProviderLoginController implements ReactiveController {
       }
     }
     return [...choices.values()].toSorted((a, b) => Number(b.featured) - Number(a.featured));
+  }
+
+  private reconnectOptions(provider: string): ProviderLoginOption[] {
+    return this.loginOptions([provider]).filter(
+      (option) => option.kind === "oauth" || option.kind === "device-code",
+    );
+  }
+
+  private reconnect(provider: string): void {
+    const options = this.reconnectOptions(provider);
+    const option = options.length === 1 ? options[0] : undefined;
+    if (!option) {
+      return;
+    }
+    this.start(option);
+  }
+
+  private start(option: ProviderLoginOption): void {
+    if (
+      !this.options.canStart() ||
+      this.mutationActive ||
+      this.cancellationPending ||
+      this.state.phase !== "idle"
+    ) {
+      return;
+    }
+    this.picker = null;
+    this.cancellationNotice = null;
+    this.refreshWarning = null;
+    void this.run(() => this.runner.start(option.id, "models.authLogin"));
   }
 
   open(providers?: string[]): void {
@@ -175,10 +208,7 @@ export class ModelProviderLoginController implements ReactiveController {
                   if (!selected || !this.options.canStart()) {
                     return;
                   }
-                  this.picker = null;
-                  this.cancellationNotice = null;
-                  this.refreshWarning = null;
-                  void this.run(() => this.runner.start(selected.id, "models.authLogin"));
+                  this.start(selected);
                 }}
               >
                 ${t("modelProviders.login.action")}
