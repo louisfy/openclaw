@@ -129,6 +129,7 @@ export class ModelProviderLoginController implements ReactiveController {
     this.picker = null;
     this.cancellationNotice = null;
     this.refreshWarning = null;
+    this.message = undefined;
     void this.run(() => this.runner.start(option.id, "models.authLogin"));
   }
 

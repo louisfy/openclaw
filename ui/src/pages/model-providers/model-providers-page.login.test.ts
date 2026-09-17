@@ -30,6 +30,7 @@ function loginHarness(harnessOptions: { expiredXai?: boolean } = {}) {
   const secretChoice = harnessOptions.expiredXai ? "xai/xai-api-key" : "example-secret";
   const browserChoice = harnessOptions.expiredXai ? "xai/xai-oauth" : "example-browser";
   let saved = false;
+  let failNextLogin = false;
   let stepShown = false;
   const answer = deferred<WizardNextResult>();
   const cancel = deferred<{ status: "running" | "cancelled" }>();
@@ -92,6 +93,10 @@ function loginHarness(harnessOptions: { expiredXai?: boolean } = {}) {
       case "models.authStatus":
         return authStatus();
       case "models.authLogin":
+        if (failNextLogin) {
+          failNextLogin = false;
+          throw new Error("Fresh sign-in failed");
+        }
         return { done: false, status: "running" };
       case "wizard.next":
         if (!stepShown) {
@@ -121,7 +126,18 @@ function loginHarness(harnessOptions: { expiredXai?: boolean } = {}) {
     const value = await task(context.gateway.snapshot.client!);
     return { ok: true, value, refresh: { ok: true } };
   };
-  return { ...harness, answer, cancel, status };
+  return {
+    ...harness,
+    answer,
+    cancel,
+    status,
+    expireProfile: () => {
+      saved = false;
+    },
+    rejectNextLogin: () => {
+      failNextLogin = true;
+    },
+  };
 }
 
 async function openLogin(page: ModelProvidersPageTestElement, choice = "example-secret") {
@@ -174,6 +190,37 @@ describe("Models provider login", () => {
       { timeoutMs: null },
     );
     expect(page.querySelector("[data-models-login-choice]")).toBeNull();
+  });
+
+  it("clears a previous success before a failed OAuth reconnect", async () => {
+    const { context, answer, expireProfile, rejectNextLogin } = loginHarness({ expiredXai: true });
+    const page = appendPage(context);
+    await waitForFast(() =>
+      expect(
+        page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect"),
+      ).not.toBeNull(),
+    );
+
+    page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect")!.click();
+    await waitForFast(() =>
+      expect(page.querySelector<HTMLInputElement>('input[name="wizard-text"]')).not.toBeNull(),
+    );
+    await submitCredential(page);
+    answer.resolve({ done: true, status: "done" });
+    await waitForFast(() => expect(page.textContent).toContain("Provider credentials saved."));
+
+    expireProfile();
+    rejectNextLogin();
+    await page.refresh("forced");
+    await waitForFast(() =>
+      expect(
+        page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect"),
+      ).not.toBeNull(),
+    );
+    page.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect")!.click();
+
+    await waitForFast(() => expect(page.textContent).toContain("Fresh sign-in failed"));
+    expect(page.textContent).not.toContain("Provider credentials saved.");
   });
 
   it("saves credentials through the selected manifest choice and refreshes the provider card", async () => {
