@@ -269,6 +269,129 @@ describe("memory duplicates CLI", () => {
     });
   });
 
+  it.each([
+    {
+      name: "extra directory inside a remote workspace",
+      remote: "../remote",
+      extra: "../remote/memory",
+    },
+    {
+      name: "extra file inside a remote workspace",
+      remote: "../remote",
+      extra: "../remote/memory/a.md",
+    },
+    {
+      name: "recursive extra directory containing a remote workspace",
+      remote: "docs/remote",
+      extra: "docs",
+    },
+    { name: "remote subtree inside memory", remote: "memory/ops", extra: undefined },
+    { name: "selected workspace inside a remote workspace", remote: "..", extra: undefined },
+  ])("refuses $name before returning a local report", async ({ remote, extra }) => {
+    await write("memory/local.md", policy);
+    await write(path.join(remote, "memory/a.md"), policy);
+    config.current.agents = {
+      entries: {
+        main: { workspace },
+        ops: { workspace: path.resolve(workspace, remote) },
+      },
+    };
+    config.current.memory = { search: { extraPaths: extra ? [extra] : [] } };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    const json = spyRuntimeJson(defaultRuntime);
+    await expect(run("--agent", "main", "--json", "--min-chars", "1")).rejects.toMatchObject({
+      code: "WORKSPACE_ACCESS_UNAVAILABLE",
+    });
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it.each(["docs/ops", "memory-ops"])(
+    "keeps the unscanned remote directory %s from blocking local memory",
+    async (remote) => {
+      await write("memory/local.md", policy);
+      await write(path.join(remote, "memory/a.md"), policy);
+      config.current.agents = {
+        entries: {
+          main: { workspace },
+          ops: { workspace: path.resolve(workspace, remote) },
+        },
+      };
+      config.current.plugins = {
+        entries: {
+          "file-transfer": {
+            config: {
+              workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+            },
+          },
+        },
+      };
+      const json = spyRuntimeJson(defaultRuntime);
+      await run("--agent", "main", "--json", "--min-chars", "1");
+      expect(firstWrittenJsonArg<Report>(json)).toMatchObject({ filesScanned: 1, groups: [] });
+    },
+  );
+
+  it("refuses a patterned extra root that overlaps a remote workspace", async () => {
+    config.current.agents = {
+      entries: {
+        main: { workspace },
+        ops: { workspace: path.join(workspace, "docs/ops") },
+      },
+    };
+    config.current.memory = { search: { extraPaths: [{ path: "docs", pattern: "**/*.md" }] } };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    await expect(run("--agent", "main", "--json")).rejects.toMatchObject({
+      code: "WORKSPACE_ACCESS_UNAVAILABLE",
+    });
+  });
+
+  it("rejects an extra path with a symlinked parent pointing into a mapped remote root", async () => {
+    const remote = path.resolve(workspace, "../remote");
+    await write("memory/local.md", policy);
+    await write("../remote/memory/copied.md", policy);
+    await fs.symlink(remote, path.join(workspace, "alias"), "dir");
+    config.current.agents = { entries: { main: { workspace }, ops: { workspace: remote } } };
+    config.current.memory = { search: { extraPaths: ["alias/memory"] } };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    await expect(run("--agent", "main", "--json")).rejects.toMatchObject({
+      code: "WORKSPACE_ACCESS_UNAVAILABLE",
+    });
+  });
+
+  it.each(["memory", "docs"])(
+    "honors declared unavailable ownership of the %s scan root",
+    async (relative) => {
+      const scanRoot = path.join(workspace, relative);
+      declareAgentWorkspaceAccess(scanRoot);
+      config.current.memory = { search: { extraPaths: [relative] } };
+      await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
+    },
+  );
+
   it("respects a declared but unavailable workspace owner", async () => {
     await write("memory/a.md", policy);
     await write("memory/b.md", policy);
@@ -276,6 +399,23 @@ describe("memory duplicates CLI", () => {
     const json = spyRuntimeJson(defaultRuntime);
     await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
     expect(json).not.toHaveBeenCalled();
+  });
+
+  it("honors unavailable workspace ownership through a symlinked parent alias", async () => {
+    await write("memory/local.md", policy);
+    declareAgentWorkspaceAccess(workspace);
+    const alias = path.join(roots.make("openclaw-memory-alias-"), "alias");
+    await fs.symlink(path.dirname(workspace), alias, "dir");
+    config.current.agents = { entries: { main: { workspace: path.join(alias, "workspace") } } };
+    await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
+  });
+
+  it("honors declared ownership above an extra memory subdirectory", async () => {
+    const remote = path.resolve(workspace, "../remote");
+    await write("../remote/memory/copied.md", policy);
+    declareAgentWorkspaceAccess(remote);
+    config.current.memory = { search: { extraPaths: [path.join(remote, "memory")] } };
+    await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
   });
 
   it("reports disabled memory and refuses another plugin's memory slot", async () => {

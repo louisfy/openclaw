@@ -135,7 +135,13 @@ the local Gateway first.
 Remote workspace mappings are not supported by this offline diagnostic. It
 refuses configured `file-transfer` mappings (including another agent mapping the
 same directory) and declared remote Memory owners rather than inspecting an
-absent or stale Gateway-local copy. Run it on the workspace host with a
+absent or stale Gateway-local copy. Before discovering files, it checks default
+memory roots and normalized extra paths for overlap with mapped remote workspaces,
+including nested workspaces and existing path aliases. Declared Memory ownership
+is checked at the workspace, scan roots, and their ancestors. An extra root that contains
+a remote workspace is refused even if its pattern would exclude that subtree;
+choose a narrower local root instead. Unscanned remote siblings do not block local
+memory. Run it on the workspace host with a
 local-workspace configuration instead. It does not connect to a remote node.
 
 The diagnostic uses the existing Markdown chunker with 400-token blocks,

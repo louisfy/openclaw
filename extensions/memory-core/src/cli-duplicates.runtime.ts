@@ -1,12 +1,18 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import {
   getAgentWorkspaceAccess,
   WorkspaceAccessUnavailableError,
 } from "openclaw/plugin-sdk/agent-workspace-runtime";
-import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import {
+  isPathInside,
+  resolveAgentWorkspaceDir,
+} from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { chunkMarkdown, hashText } from "openclaw/plugin-sdk/memory-core-host-engine-indexing";
 import {
+  isFileMissingError,
   listMemoryFiles,
+  normalizeExtraMemoryPathEntries,
   readMemoryFile,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { defaultRuntime } from "openclaw/plugin-sdk/memory-core-host-runtime-cli";
@@ -21,6 +27,32 @@ const MAX_LOCATIONS_PER_GROUP = 20;
 
 type DuplicateLocation = { path: string; startLine: number; endLine: number };
 type DuplicateGroup = { occurrences: number; locations: DuplicateLocation[] };
+
+async function resolveScanPath(filePath: string): Promise<{ lexical: string; canonical: string }> {
+  const lexical = path.resolve(filePath);
+  try {
+    return { lexical, canonical: await fs.realpath(lexical) };
+  } catch (error) {
+    if (!isFileMissingError(error)) {
+      throw error;
+    }
+    return { lexical, canonical: lexical };
+  }
+}
+
+function hasRemoteMemoryOwner(directory: string): boolean {
+  let current = directory;
+  for (;;) {
+    if (getAgentWorkspaceAccess(current, "memoryFiles")) {
+      return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
 
 export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions): Promise<void> {
   // This file-only diagnostic needs neither resolved embedding credentials nor an index manager.
@@ -42,18 +74,51 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
     return;
   }
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-  // Offline CLI loading may not register providers. Configured mappings still own their files,
-  // including when another agent maps the same workspace directory.
+  // Check every discovery root before listing files. Offline loading may not register providers,
+  // but configured remote ownership still applies to extra paths and nested workspaces.
+  const scanRoots = [
+    { path: path.join(workspaceDir, "MEMORY.md"), recursive: false },
+    { path: path.join(workspaceDir, "USER.md"), recursive: false },
+    { path: path.join(workspaceDir, "memory"), recursive: true },
+    ...normalizeExtraMemoryPathEntries(workspaceDir, settings.extraPaths).map((entry) => ({
+      path: entry.path,
+      recursive: true,
+    })),
+  ];
   const remoteMappings = asOptionalRecord(
     asOptionalRecord(cfg.plugins?.entries?.["file-transfer"]?.config)?.workspaces,
   );
-  const configuredRemote = Object.keys(remoteMappings ?? {}).some(
-    (mappedAgentId) =>
-      path.resolve(resolveAgentWorkspaceDir(cfg, mappedAgentId)) === path.resolve(workspaceDir),
+  const remoteRoots = await Promise.all(
+    Object.keys(remoteMappings ?? {}).map((id) =>
+      resolveScanPath(resolveAgentWorkspaceDir(cfg, id)),
+    ),
   );
-  if (configuredRemote || getAgentWorkspaceAccess(workspaceDir, "memoryFiles")) {
+  const roots = await Promise.all(
+    scanRoots.map(async (root) => {
+      const resolved = await resolveScanPath(root.path);
+      return {
+        recursive: root.recursive,
+        lexical: resolved.lexical,
+        canonical: resolved.canonical,
+      };
+    }),
+  );
+  const configuredRemote = roots.some((root) =>
+    remoteRoots.some((remote) =>
+      (["lexical", "canonical"] as const).some(
+        (kind) =>
+          isPathInside(remote[kind], root[kind]) ||
+          (root.recursive && isPathInside(root[kind], remote[kind])),
+      ),
+    ),
+  );
+  const workspace = await resolveScanPath(workspaceDir);
+  const declaredRemote = [workspace, ...roots].some((root) =>
+    [root.lexical, root.canonical].some(hasRemoteMemoryOwner),
+  );
+  if (configuredRemote || declaredRemote) {
     throw new WorkspaceAccessUnavailableError(
-      "memory duplicates requires a local workspace; run it on the workspace host with a local-workspace configuration. Remote workspace mappings cannot be scanned offline.",
+      "memory duplicates requires a local workspace and local scan roots; run it on the workspace host with a local-workspace configuration. Remote workspace mappings cannot be scanned offline.",
     );
   }
   const files = await listMemoryFiles(workspaceDir, settings.extraPaths);
