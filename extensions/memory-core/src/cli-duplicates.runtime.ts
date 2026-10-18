@@ -1,4 +1,8 @@
 import path from "node:path";
+import {
+  getAgentWorkspaceAccess,
+  WorkspaceAccessUnavailableError,
+} from "openclaw/plugin-sdk/agent-workspace-runtime";
 import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { chunkMarkdown, hashText } from "openclaw/plugin-sdk/memory-core-host-engine-indexing";
 import {
@@ -8,6 +12,7 @@ import {
 import { defaultRuntime } from "openclaw/plugin-sdk/memory-core-host-runtime-cli";
 import { resolveMemorySearchIndexConfig } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import { captureRuntimeConfigAsyncReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveForeignMemorySlotOwner } from "./cli-memory-slot.js";
 import { resolveMemoryAgent } from "./cli-runtime-common.js";
 import type { MemoryDuplicatesCommandOptions } from "./cli.types.js";
@@ -37,6 +42,20 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
     return;
   }
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+  // Offline CLI loading may not register providers. Configured mappings still own their files,
+  // including when another agent maps the same workspace directory.
+  const remoteMappings = asOptionalRecord(
+    asOptionalRecord(cfg.plugins?.entries?.["file-transfer"]?.config)?.workspaces,
+  );
+  const configuredRemote = Object.keys(remoteMappings ?? {}).some(
+    (mappedAgentId) =>
+      path.resolve(resolveAgentWorkspaceDir(cfg, mappedAgentId)) === path.resolve(workspaceDir),
+  );
+  if (configuredRemote || getAgentWorkspaceAccess(workspaceDir, "memoryFiles")) {
+    throw new WorkspaceAccessUnavailableError(
+      "memory duplicates requires a local workspace; run it on the workspace host with a local-workspace configuration. Remote workspace mappings cannot be scanned offline.",
+    );
+  }
   const files = await listMemoryFiles(workspaceDir, settings.extraPaths);
   const groupsByHash = new Map<string, DuplicateGroup>();
   let filesScanned = 0;

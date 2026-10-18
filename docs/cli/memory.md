@@ -132,6 +132,12 @@ configured without an explicit default. Other memory plugins and
 session transcripts are not scanned. Like other offline memory commands, stop
 the local Gateway first.
 
+Remote workspace mappings are not supported by this offline diagnostic. It
+refuses configured `file-transfer` mappings (including another agent mapping the
+same directory) and declared remote Memory owners rather than inspecting an
+absent or stale Gateway-local copy. Run it on the workspace host with a
+local-workspace configuration instead. It does not connect to a remote node.
+
 The diagnostic uses the existing Markdown chunker with 400-token blocks,
 entry boundaries, and no overlap. It compares exact text after normalizing CRLF
 line endings and removing empty boundary lines. It does not find paraphrases or

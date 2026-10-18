@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
+import { declareAgentWorkspaceAccess } from "openclaw/plugin-sdk/agent-workspace-runtime";
 import { defaultRuntime } from "openclaw/plugin-sdk/memory-core-host-runtime-cli";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
@@ -202,6 +203,79 @@ describe("memory duplicates CLI", () => {
     const json = spyRuntimeJson(defaultRuntime);
     await run("--json");
     expect(firstWrittenJsonArg<Report>(json)).toMatchObject({ filesScanned: 1, groups: [] });
+  });
+
+  it.each([false, true])(
+    "refuses a configured remote workspace instead of scanning a local copy (stale=%s)",
+    async (stale) => {
+      if (stale) {
+        await write("memory/a.md", policy);
+        await write("memory/b.md", policy);
+      } else {
+        await fs.rm(workspace, { recursive: true });
+      }
+      config.current.plugins = {
+        entries: {
+          "file-transfer": {
+            config: {
+              workspaces: {
+                main: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" },
+              },
+            },
+          },
+        },
+      };
+      const json = spyRuntimeJson(defaultRuntime);
+      await expect(run("--json")).rejects.toThrow("memory duplicates requires a local workspace");
+      expect(json).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a remote mapping for another agent sharing the selected workspace", async () => {
+    config.current.agents = { entries: { main: { workspace }, ops: { workspace } } };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    await expect(run("--agent", "main", "--json")).rejects.toThrow(
+      "memory duplicates requires a local workspace",
+    );
+  });
+
+  it("does not block a local workspace because another agent has a different remote workspace", async () => {
+    config.current.agents = {
+      entries: { main: { workspace }, ops: { workspace: path.join(workspace, "ops") } },
+    };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    const json = spyRuntimeJson(defaultRuntime);
+    await run("--agent", "main", "--json");
+    expect(firstWrittenJsonArg<Report>(json)).toMatchObject({
+      agentId: "main",
+      filesScanned: 0,
+      groups: [],
+    });
+  });
+
+  it("respects a declared but unavailable workspace owner", async () => {
+    await write("memory/a.md", policy);
+    await write("memory/b.md", policy);
+    declareAgentWorkspaceAccess(workspace);
+    const json = spyRuntimeJson(defaultRuntime);
+    await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
+    expect(json).not.toHaveBeenCalled();
   });
 
   it("reports disabled memory and refuses another plugin's memory slot", async () => {
