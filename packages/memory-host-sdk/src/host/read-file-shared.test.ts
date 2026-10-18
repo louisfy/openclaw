@@ -34,6 +34,51 @@ describe("memory read result slicing", () => {
       from: 5,
       text: "## Refunds\nActual",
     },
+    ...[
+      { name: "list fences", open: "- ~~~md", body: "  # Example", close: "  ~~~" },
+      { name: "numbered list fences", open: "10. ```md", body: "    # Example", close: "    ```" },
+      { name: "quoted fences", open: "> ~~~md", body: "> # Example", close: "> ~~~" },
+      {
+        name: "nested list/quote fences",
+        open: "- > ```md",
+        body: "  > # Example",
+        close: "  > ```",
+      },
+    ].map(({ name, open, body, close }) => ({
+      name,
+      content: `${open}\n${body}\n${close}\n\n## Refunds\n30 days`,
+      heading: "Refunds",
+      from: 5,
+      text: "## Refunds\n30 days",
+    })),
+    {
+      name: "a BOM-prefixed first heading",
+      content: "\uFEFF## Refunds\n30 days",
+      heading: "Refunds",
+      from: 1,
+      text: "\uFEFF## Refunds\n30 days",
+    },
+    {
+      name: "a leading horizontal rule without a frontmatter close",
+      content: "---\n\n## Refunds\n30 days",
+      heading: "Refunds",
+      from: 3,
+      text: "## Refunds\n30 days",
+    },
+    {
+      name: "an unterminated list fence whose container ended",
+      content: "- ~~~md\n  # Example\n\n## Refunds\n30 days",
+      heading: "Refunds",
+      from: 4,
+      text: "## Refunds\n30 days",
+    },
+    {
+      name: "an unterminated quote fence whose container ended",
+      content: "> ```md\n> # Example\n\n## Refunds\n30 days",
+      heading: "Refunds",
+      from: 4,
+      text: "## Refunds\n30 days",
+    },
   ])(
     "reads $name with original line numbers and no sibling continuation",
     ({ content, heading, from, text }) => {

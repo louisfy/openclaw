@@ -17,29 +17,47 @@ function findMemoryHeadingRange(
   heading: string,
 ): { start: number; end: number } {
   const headings: Array<{ title: string; level: number; index: number }> = [];
-  let fence: { marker: string; length: number } | undefined;
-  let frontmatter = fileLines[0]?.trim() === "---";
-  for (let index = 0; index < fileLines.length; index += 1) {
-    const line = (fileLines[index] ?? "").replace(/\r$/u, "");
-    if (frontmatter) {
-      if (index > 0 && /^(?:---|\.\.\.)\s*$/u.test(line)) {
-        frontmatter = false;
-      }
-      continue;
-    }
-    const fenceMatch = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(line);
+  let fence: { marker: string; length: number; continuation: RegExp } | undefined;
+  // An unmatched opening rule is Markdown, not a frontmatter block extending to EOF.
+  const frontmatterEnd =
+    fileLines[0]?.trim() === "---"
+      ? fileLines.findIndex((line, index) => index > 0 && /^(?:---|\.\.\.)\s*$/u.test(line))
+      : -1;
+  for (let index = frontmatterEnd + 1; index < fileLines.length; index += 1) {
+    const rawLine = (fileLines[index] ?? "").replace(/\r$/u, "");
+    const line = index === 0 ? rawLine.replace(/^\uFEFF/u, "") : rawLine;
     if (fence) {
-      if (
-        fenceMatch?.[1]?.[0] === fence.marker &&
-        fenceMatch[1].length >= fence.length &&
-        !fenceMatch[2]?.trim()
-      ) {
-        fence = undefined;
+      const prefix = fence.continuation.exec(line);
+      if (prefix || !line.trim()) {
+        const close = /^ {0,3}(`{3,}|~{3,})[\t ]*$/u.exec(line.slice(prefix?.[0].length ?? 0));
+        if (close?.[1]?.[0] === fence.marker && close[1].length >= fence.length) {
+          fence = undefined;
+        }
+        continue;
       }
-      continue;
+      // A fence inside a list/quote also ends when its enclosing container ends.
+      fence = undefined;
     }
+    let fenceLine = line;
+    let continuation = "";
+    // Container markers belong to the opener; list markers become indentation on later lines.
+    for (
+      let container = /^( {0,3})(>[\t ]?|(?:[-+*]|\d{1,9}[.)])[\t ]+)/u.exec(fenceLine);
+      container;
+      container = /^( {0,3})(>[\t ]?|(?:[-+*]|\d{1,9}[.)])[\t ]+)/u.exec(fenceLine)
+    ) {
+      continuation += container[2]!.startsWith(">")
+        ? " {0,3}>[\\t ]?"
+        : ` {${container[0].length}}`;
+      fenceLine = fenceLine.slice(container[0].length);
+    }
+    const fenceMatch = /^ {0,3}(`{3,}|~{3,})(.*)$/u.exec(fenceLine);
     if (fenceMatch && !(fenceMatch[1]![0] === "`" && fenceMatch[2]?.includes("`"))) {
-      fence = { marker: fenceMatch[1]![0]!, length: fenceMatch[1]!.length };
+      fence = {
+        marker: fenceMatch[1]![0]!,
+        length: fenceMatch[1]!.length,
+        continuation: new RegExp(`^${continuation}`, "u"),
+      };
       continue;
     }
     const match = /^ {0,3}(#{1,6})(?:[\t ]+(.*)|[\t ]*)$/u.exec(line);
