@@ -103,7 +103,10 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
       };
     }),
   );
-  const configuredRemote = roots.some((root) =>
+  const workspace = await resolveScanPath(workspaceDir);
+  // Missing scan roots retain lexical aliases; the workspace can still resolve its remote owner.
+  // The workspace itself is not recursively scanned, so unscanned remote descendants stay allowed.
+  const configuredRemote = [{ ...workspace, recursive: false }, ...roots].some((root) =>
     remoteRoots.some((remote) =>
       (["lexical", "canonical"] as const).some(
         (kind) =>
@@ -112,7 +115,6 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
       ),
     ),
   );
-  const workspace = await resolveScanPath(workspaceDir);
   const declaredRemote = [workspace, ...roots].some((root) =>
     [root.lexical, root.canonical].some(hasRemoteMemoryOwner),
   );

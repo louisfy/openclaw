@@ -247,6 +247,29 @@ describe("memory duplicates CLI", () => {
     );
   });
 
+  it("rejects a configured remote workspace alias when every default memory root is absent", async () => {
+    await fs.rmdir(path.join(workspace, "memory"));
+    const alias = path.join(roots.make("openclaw-memory-empty-alias-"), "alias");
+    await fs.symlink(workspace, alias, "dir");
+    config.current.agents = {
+      entries: { main: { workspace: alias }, ops: { workspace } },
+    };
+    config.current.plugins = {
+      entries: {
+        "file-transfer": {
+          config: {
+            workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+          },
+        },
+      },
+    };
+    const json = spyRuntimeJson(defaultRuntime);
+    await expect(run("--agent", "main", "--json")).rejects.toMatchObject({
+      code: "WORKSPACE_ACCESS_UNAVAILABLE",
+    });
+    expect(json).not.toHaveBeenCalled();
+  });
+
   it("does not block a local workspace because another agent has a different remote workspace", async () => {
     config.current.agents = {
       entries: { main: { workspace }, ops: { workspace: path.join(workspace, "ops") } },
