@@ -293,22 +293,24 @@ export function createLlmTaskTool(api: OpenClawPluginApi) {
       const batchSignal = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal;
       const expiresAt = Date.now() + timeoutMs;
       const timer = setTimeout(() => deadline.abort(), timeoutMs);
-      const tasks = batch.inputs.map(({ id, inputJson }) => async (): Promise<ItemResult> => {
-        const remainingMs = expiresAt - Date.now();
-        if (remainingMs <= 0) {
+      const isBatchAborted = () => {
+        // Settlement can reach the deadline before its timer callback gets an event-loop turn.
+        if (Date.now() >= expiresAt) {
           deadline.abort();
         }
-        if (batchSignal.aborted) {
+        return batchSignal.aborted;
+      };
+      const tasks = batch.inputs.map(({ id, inputJson }) => async (): Promise<ItemResult> => {
+        const remainingMs = expiresAt - Date.now();
+        if (isBatchAborted()) {
           return { id, status: "not_started" };
         }
         try {
           const result = await completeJson(inputJson, batchSignal, remainingMs);
-          return batchSignal.aborted
-            ? { id, status: "cancelled" }
-            : { id, status: "ok", ...result };
+          return isBatchAborted() ? { id, status: "cancelled" } : { id, status: "ok", ...result };
         } catch (error) {
           // Provider errors can contain credentials or echoed input. Only stable categories leave this boundary.
-          return batchSignal.aborted
+          return isBatchAborted()
             ? { id, status: "cancelled" }
             : {
                 id,

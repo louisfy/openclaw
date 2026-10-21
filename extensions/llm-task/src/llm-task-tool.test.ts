@@ -394,4 +394,39 @@ describe("llm-task tool (json-only)", () => {
     expect(complete).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it.each(["resolve", "reject"] as const)(
+    "honors an elapsed deadline before its timer callback when completion %s settles",
+    async (outcome) => {
+      vi.useFakeTimers();
+      const expiresAt = Date.now() + 100;
+      mockIsolatedCompletionJson({ saved: true });
+      complete.mockImplementationOnce(async (params) => {
+        // Moving wall time without running timers models a busy event loop at settlement.
+        vi.setSystemTime(expiresAt);
+        if (outcome === "reject") {
+          throw new Error("synthetic completion failure");
+        }
+        return completionResult(params);
+      });
+      const result = await tool.execute("batch", {
+        prompt: "x",
+        timeoutMs: 100,
+        batch: {
+          concurrency: 1,
+          items: ["done", "active", "queued"].map((id) => ({ id, input: id })),
+        },
+      });
+      expect(result.details.json).toEqual({
+        status: "timed_out",
+        results: [
+          { id: "done", status: "ok", json: { saved: true }, provider: "openai", model: "gpt-5.5" },
+          { id: "active", status: "cancelled" },
+          { id: "queued", status: "not_started" },
+        ],
+      });
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 });
