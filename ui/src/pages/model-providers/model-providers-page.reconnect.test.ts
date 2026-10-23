@@ -15,13 +15,16 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function reconnectHarness(kinds: ("oauth" | "device-code" | "secret")[]) {
+function reconnectHarness(
+  kinds: ("oauth" | "device-code" | "secret")[],
+  source: "saved" | "external" = "saved",
+) {
   const health = createAuthStatus([
     {
       provider: "xai",
       displayName: "xAI",
       status: "expired",
-      profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired" }],
+      profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired", source }],
     },
   ]);
   const capabilities = [
@@ -104,6 +107,15 @@ it.each([
   const { context, request } = reconnectHarness([...kinds]);
   const page = appendPage(context);
   const row = await expandProvider(page, "xai");
+  expect(row.querySelector(".model-providers__profile-reconnect")).toBeNull();
+  expect(request.mock.calls.filter(([method]) => method === "models.authLogin")).toHaveLength(0);
+});
+
+it("keeps an externally sourced OAuth account read-only without an externallyManaged flag", async () => {
+  const { context, request } = reconnectHarness(["oauth"], "external");
+  const page = appendPage(context);
+  const row = await expandProvider(page, "xai");
+  expect(row.querySelector('[data-profile-id="xai:expired"]')).not.toBeNull();
   expect(row.querySelector(".model-providers__profile-reconnect")).toBeNull();
   expect(request.mock.calls.filter(([method]) => method === "models.authLogin")).toHaveLength(0);
 });

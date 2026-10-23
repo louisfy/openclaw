@@ -134,6 +134,7 @@ it("reconnects only expired, locally managed OAuth accounts through their creden
   for (const profile of [
     { profileId: "xai:expired", type: "oauth", status: "ok" },
     { profileId: "xai:expired", type: "oauth", status: "expired", externallyManaged: true },
+    { profileId: "xai:expired", type: "oauth", status: "expired", source: "external" },
     { profileId: "xai:expired", type: "api_key", status: "expired" },
   ] as const) {
     update({ ...providerCard, profiles: [profile] }, viewProps);
