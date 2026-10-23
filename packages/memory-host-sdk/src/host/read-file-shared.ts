@@ -30,6 +30,7 @@ function parseMemoryContainerPrefix(line: string) {
   // Empty items and 5+ padding columns use one column; the latter leaves indented code.
   const padding = list ? (empty || spaces > 4 ? 1 : spaces) : Math.min(spaces, 1);
   return {
+    list,
     length: match[1]!.length + marker.length + (empty ? spaces : padding),
     continuation: list ? ` {${match[1]!.length + marker.length + padding}}` : " {0,3}> ?",
     empty,
@@ -73,7 +74,10 @@ function isCompleteMemoryHtmlTag(source: string): boolean {
   return true;
 }
 
-/** HTML blocks either close at their literal terminator or at the next blank line. */
+/**
+ * CommonMark block boundaries, not HTML sanitization: type 2 closes only at "-->", not "--!>".
+ * https://spec.commonmark.org/0.31.2/#html-blocks
+ */
 function parseMemoryHtmlBlockStart(line: string) {
   const source = /^ {0,3}(<[\s\S]*)$/u.exec(line)?.[1];
   if (!source) {
@@ -118,14 +122,14 @@ function findMemoryHeadingRange(
   heading: string,
 ): { start: number; end: number } {
   const headings: Array<{ title: string; level: number; index: number }> = [];
-  const containers: RegExp[] = [];
+  const containers: Array<{ prefix: RegExp; list: boolean }> = [];
   let paragraphOpen = false;
   let literalBlock: { end: RegExp; continuation: RegExp } | undefined;
+  // Canonical frontmatter delimiters are column-zero "---" (with an optional opening BOM).
   // An unmatched opening rule is Markdown, not a frontmatter block extending to EOF.
-  const frontmatterEnd =
-    fileLines[0]?.trim() === "---"
-      ? fileLines.findIndex((line, index) => index > 0 && /^(?:---|\.\.\.)\s*$/u.test(line))
-      : -1;
+  const frontmatterEnd = /^\uFEFF?---[^\S\n]*$/u.test(fileLines[0] ?? "")
+    ? fileLines.findIndex((line, index) => index > 0 && /^---[^\S\n]*$/u.test(line))
+    : -1;
   for (let index = frontmatterEnd + 1; index < fileLines.length; index += 1) {
     const rawLine = (fileLines[index] ?? "").replace(/\r$/u, "");
     const sourceLine = index === 0 ? rawLine.replace(/^\uFEFF/u, "") : rawLine;
@@ -134,19 +138,25 @@ function findMemoryHeadingRange(
     let continuation = "";
     let continuedContainers = 0;
     for (const container of containers) {
-      const prefix = container.exec(fenceLine);
+      const prefix = container.prefix.exec(fenceLine);
       if (!prefix) {
         break;
       }
       fenceLine = fenceLine.slice(prefix[0].length);
-      continuation += container.source.slice(1);
+      continuation += container.prefix.source.slice(1);
       continuedContainers += 1;
     }
     let followsParagraph: boolean = paragraphOpen && continuedContainers === containers.length;
+    const nextContainer = parseMemoryContainerPrefix(fenceLine);
+    // A sibling item ends the prior item even when its number cannot interrupt a paragraph.
+    const siblingList =
+      nextContainer?.list &&
+      containers.some((container, position) => position >= continuedContainers && container.list);
     if (
       continuedContainers < containers.length &&
       paragraphOpen &&
-      !parseMemoryContainerPrefix(fenceLine)?.empty &&
+      !nextContainer?.empty &&
+      !siblingList &&
       canContinueMemoryParagraph(fenceLine)
     ) {
       continue;
@@ -174,7 +184,10 @@ function findMemoryHeadingRange(
       container && (!followsParagraph || container.interruptsParagraph);
       container = parseMemoryContainerPrefix(fenceLine)
     ) {
-      containers.push(new RegExp(`^${container.continuation}`, "u"));
+      containers.push({
+        prefix: new RegExp(`^${container.continuation}`, "u"),
+        list: container.list,
+      });
       continuation += container.continuation;
       fenceLine = fenceLine.slice(container.length);
       followsParagraph = false;
