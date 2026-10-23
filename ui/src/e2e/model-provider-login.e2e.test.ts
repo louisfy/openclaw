@@ -460,6 +460,8 @@ suite.define(() => {
                       email: "expired@example.invalid",
                       type: "oauth",
                       status: "expired",
+                      logoutSupported: true,
+                      reconnectSupported: true,
                     },
                   ],
                 },

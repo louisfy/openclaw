@@ -117,7 +117,9 @@ afterEach(() => {
 it("reconnects only expired, locally managed OAuth accounts through their credential owner", () => {
   const onReconnect = vi.fn();
   const providerCard = card({
-    profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired" }],
+    profiles: [
+      { profileId: "xai:expired", type: "oauth", status: "expired", reconnectSupported: true },
+    ],
     profileProviderIds: { "xai:expired": "xai" },
   });
   const viewProps = props({ canReconnect: (provider) => provider === "xai", onReconnect });
@@ -135,6 +137,17 @@ it("reconnects only expired, locally managed OAuth accounts through their creden
     { profileId: "xai:expired", type: "oauth", status: "ok" },
     { profileId: "xai:expired", type: "oauth", status: "expired", externallyManaged: true },
     { profileId: "xai:expired", type: "oauth", status: "expired", source: "external" },
+    { profileId: "xai:expired", type: "oauth", status: "expired", source: "config" },
+    { profileId: "xai:expired", type: "oauth", status: "expired", source: "inherited" },
+    {
+      profileId: "xai:expired",
+      type: "oauth",
+      status: "expired",
+      source: "inherited",
+      logoutSupported: true,
+    },
+    { profileId: "xai:expired", type: "oauth", status: "expired", source: "saved" },
+    { profileId: "xai:expired", type: "oauth", status: "expired", logoutSupported: false },
     { profileId: "xai:expired", type: "api_key", status: "expired" },
   ] as const) {
     update({ ...providerCard, profiles: [profile] }, viewProps);
@@ -142,6 +155,24 @@ it("reconnects only expired, locally managed OAuth accounts through their creden
   }
   update(providerCard, { ...viewProps, canReconnect: () => false });
   expect(button()).toBeNull();
+});
+
+it("can reconnect a config-bound OAuth profile that the Gateway independently owns", () => {
+  const providerCard = card({
+    profiles: [
+      {
+        profileId: "xai:expired",
+        type: "oauth",
+        status: "expired",
+        source: "config",
+        logoutSupported: true,
+        reconnectSupported: true,
+      },
+    ],
+    profileProviderIds: { "xai:expired": "xai" },
+  });
+  const { container } = mount(providerCard, props({ canReconnect: () => true }));
+  expect(container.querySelector(".model-providers__profile-reconnect")).not.toBeNull();
 });
 
 it("retains account summary focus while refreshed snapshots update account data and recovery", () => {

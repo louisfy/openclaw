@@ -17,14 +17,18 @@ afterEach(() => {
 
 function reconnectHarness(
   kinds: ("oauth" | "device-code" | "secret")[],
-  source: "saved" | "external" = "saved",
+  profile: {
+    source?: "saved" | "external" | "config" | "inherited";
+    logoutSupported?: boolean;
+    reconnectSupported?: boolean;
+  } = { source: "saved", logoutSupported: true, reconnectSupported: true },
 ) {
   const health = createAuthStatus([
     {
       provider: "xai",
       displayName: "xAI",
       status: "expired",
-      profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired", source }],
+      profiles: [{ profileId: "xai:expired", type: "oauth", status: "expired", ...profile }],
     },
   ]);
   const capabilities = [
@@ -44,11 +48,19 @@ function reconnectHarness(
   return loginHarness({ providers: health.providers, capabilities });
 }
 
-it.each(["oauth", "device-code"] as const)(
-  "reconnects an expired account using its advertised %s route without the picker",
-  async (kind) => {
+it.each([
+  { kind: "oauth", source: "saved" },
+  { kind: "device-code", source: "saved" },
+  { kind: "oauth", source: "config" },
+] as const)(
+  "reconnects an expired $source account using its advertised $kind route without the picker",
+  async ({ kind, source }) => {
     vi.spyOn(window, "open").mockReturnValue(null);
-    const { context, request, answer } = reconnectHarness(["secret", kind]);
+    const { context, request, answer } = reconnectHarness(["secret", kind], {
+      source,
+      logoutSupported: true,
+      reconnectSupported: true,
+    });
     const original = request.getMockImplementation()!;
     let restored = false;
     request.mockImplementation(async (method, ...args) => {
@@ -111,11 +123,25 @@ it.each([
   expect(request.mock.calls.filter(([method]) => method === "models.authLogin")).toHaveLength(0);
 });
 
-it("keeps an externally sourced OAuth account read-only without an externallyManaged flag", async () => {
-  const { context, request } = reconnectHarness(["oauth"], "external");
+it.each(["external", "config", "inherited", "saved"] as const)(
+  "keeps an expired %s account read-only without the Gateway ownership capability",
+  async (source) => {
+    const { context, request } = reconnectHarness(["oauth"], { source });
+    const page = appendPage(context);
+    const row = await expandProvider(page, "xai");
+    expect(row.querySelector('[data-profile-id="xai:expired"]')).not.toBeNull();
+    expect(row.querySelector(".model-providers__profile-reconnect")).toBeNull();
+    expect(request.mock.calls.filter(([method]) => method === "models.authLogin")).toHaveLength(0);
+  },
+);
+
+it("does not reconnect an inherited profile even when the Gateway advertises removal", async () => {
+  const { context, request } = reconnectHarness(["oauth"], {
+    source: "inherited",
+    logoutSupported: true,
+  });
   const page = appendPage(context);
   const row = await expandProvider(page, "xai");
-  expect(row.querySelector('[data-profile-id="xai:expired"]')).not.toBeNull();
   expect(row.querySelector(".model-providers__profile-reconnect")).toBeNull();
   expect(request.mock.calls.filter(([method]) => method === "models.authLogin")).toHaveLength(0);
 });

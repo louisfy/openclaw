@@ -634,8 +634,7 @@ function ProviderProfileRow(
       <span class="model-providers__profile-actions">
         {profile().type === "oauth" &&
         profile().status === "expired" &&
-        profile().source !== "external" &&
-        !profile().externallyManaged &&
+        profile().reconnectSupported === true &&
         props.canReconnect(provider()) ? (
           <button
             type="button"
