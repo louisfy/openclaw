@@ -183,9 +183,16 @@ export function registerMemoryCli(program: Command, hostOptions?: MemoryCoreRunt
       80,
     )
     .action(async (opts: MemoryDuplicatesCommandOptions) => {
-      await runMemoryCliCommand(async () => {
-        const { runMemoryDuplicates } = await import("./cli-duplicates.runtime.js");
-        await runMemoryDuplicates(opts);
+      await runWithLocalStateOwner({
+        method: "memory.cli",
+        params: {},
+        target: "memory files",
+        databaseAccess: "none",
+        onForeignOwner: "refuse",
+        runLocal: async () => {
+          const { runMemoryDuplicates } = await import("./cli-duplicates.runtime.js");
+          await runMemoryDuplicates(opts);
+        },
       });
     });
 

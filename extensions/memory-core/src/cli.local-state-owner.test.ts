@@ -53,6 +53,9 @@ describe("memory CLI owner admission", () => {
       expect.objectContaining({ method, runLocal: expect.any(Function) }),
     );
     expect(fixture.admit.mock.calls[0]?.[0].onForeignOwner).toBe(offline ? "refuse" : undefined);
+    if (args[0] === "duplicates") {
+      expect(fixture.admit.mock.calls[0]?.[0].databaseAccess).toBe("none");
+    }
     expect(fixture.runtimeLoaded).not.toHaveBeenCalled();
   });
 });

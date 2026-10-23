@@ -473,6 +473,44 @@ describe("memory duplicates CLI", () => {
     },
   );
 
+  it.each([
+    { relative: "memory", exists: false, alias: "none" },
+    { relative: "docs", exists: false, alias: "none" },
+    { relative: "memory", exists: true, alias: "none" },
+    { relative: "docs", exists: true, alias: "none" },
+    { relative: "memory", exists: false, alias: "scan" },
+    { relative: "docs", exists: false, alias: "owner" },
+  ])(
+    "rejects declared empty remote descendants before discovery: $relative, exists=$exists, alias=$alias",
+    async ({ relative, exists, alias }) => {
+      const scanRoot = path.join(workspace, relative);
+      await fs.mkdir(scanRoot, { recursive: true });
+      const declared = path.join(scanRoot, "remote");
+      if (exists) {
+        await fs.mkdir(declared);
+      }
+      let selectedWorkspace = workspace;
+      let declaredRoot = declared;
+      if (alias === "scan") {
+        selectedWorkspace = path.join(roots.make("openclaw-memory-empty-scan-alias-"), "alias");
+        await fs.symlink(workspace, selectedWorkspace, "dir");
+      } else if (alias === "owner") {
+        const ownerAlias = path.join(roots.make("openclaw-memory-empty-owner-alias-"), "alias");
+        await fs.symlink(scanRoot, ownerAlias, "dir");
+        declaredRoot = path.join(ownerAlias, "remote");
+      }
+      declareAgentWorkspaceAccess(declaredRoot);
+      config.current.agents = { entries: { main: { workspace: selectedWorkspace } } };
+      config.current.memory = { search: { extraPaths: relative === "docs" ? [relative] : [] } };
+      // mock-isolation: Passthrough observation verifies refusal before filesystem discovery.
+      const discover = vi.spyOn(memoryStorage, "listMemoryFiles");
+      const json = spyRuntimeJson(defaultRuntime);
+      await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
+      expect(discover).not.toHaveBeenCalled();
+      expect(json).not.toHaveBeenCalled();
+    },
+  );
+
   it("respects a declared but unavailable workspace owner", async () => {
     await write("memory/a.md", policy);
     await write("memory/b.md", policy);

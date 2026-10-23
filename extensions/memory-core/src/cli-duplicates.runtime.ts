@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
-  getAgentWorkspaceAccess,
+  assertLocalAgentWorkspaceScanAccess,
   WorkspaceAccessUnavailableError,
 } from "openclaw/plugin-sdk/agent-workspace-runtime";
 import { resolvePathPrefixSync } from "openclaw/plugin-sdk/file-access-runtime";
@@ -42,23 +42,12 @@ async function resolveScanPath(filePath: string): Promise<{ lexical: string; can
   }
 }
 
-function hasRemoteMemoryOwner(directory: string): boolean {
-  let current = directory;
-  for (;;) {
-    if (getAgentWorkspaceAccess(current, "memoryFiles")) {
-      return true;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) {
-      return false;
-    }
-    current = parent;
-  }
-}
-
 export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions): Promise<void> {
   // This file-only diagnostic needs neither resolved embedding credentials nor an index manager.
-  const cfg = await captureRuntimeConfigAsyncReader({ skipPluginValidation: true })();
+  const cfg = await captureRuntimeConfigAsyncReader({
+    skipPluginValidation: true,
+    observe: false,
+  })();
   const agentId = resolveMemoryAgent(cfg, opts.agent);
   const owner = resolveForeignMemorySlotOwner(cfg);
   if (owner) {
@@ -116,14 +105,12 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
       ),
     ),
   );
-  const declaredRemote = [workspace, ...roots].some((root) =>
-    [root.lexical, root.canonical].some(hasRemoteMemoryOwner),
-  );
-  if (configuredRemote || declaredRemote) {
+  if (configuredRemote) {
     throw new WorkspaceAccessUnavailableError(
       "memory duplicates requires a local workspace and local scan roots; run it on the workspace host with a local-workspace configuration. Remote workspace mappings cannot be scanned offline.",
     );
   }
+  assertLocalAgentWorkspaceScanAccess([{ path: workspaceDir }, ...scanRoots], "memoryFiles");
   const files = await listMemoryFiles(workspaceDir, settings.extraPaths);
   const groupsByHash = new Map<string, DuplicateGroup>();
   let filesScanned = 0;
@@ -131,12 +118,7 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
   const minChars = opts.minChars ?? 80;
   for (const file of files.toSorted()) {
     // Providers can declare owners below recursive roots; admit each file before reading it.
-    const resolved = await resolveScanPath(file);
-    if ([resolved.lexical, resolved.canonical].some(hasRemoteMemoryOwner)) {
-      throw new WorkspaceAccessUnavailableError(
-        "memory duplicates requires local memory files; run it on the workspace host with a local-workspace configuration.",
-      );
-    }
+    assertLocalAgentWorkspaceScanAccess([{ path: file }], "memoryFiles");
     const result = await readMemoryFile({
       workspaceDir,
       extraPaths: settings.extraPaths,
