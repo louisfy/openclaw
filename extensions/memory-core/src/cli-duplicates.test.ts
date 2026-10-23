@@ -543,7 +543,9 @@ describe("memory duplicates CLI", () => {
     await run("--json");
     expect(firstWrittenJsonArg(json)).toEqual({ agentId: "main", status: "disabled" });
     config.current.plugins = { slots: { memory: "knowledge" } };
-    await expect(run("--json")).rejects.toThrow('memory slot selects "knowledge"');
+    await expect(run("--json")).rejects.toThrow(
+      "memory slot selects \"knowledge\". Use the knowledge plugin's own commands or the agent's memory tools.",
+    );
   });
 
   it.each(["--min-chars", "--max-groups"])(

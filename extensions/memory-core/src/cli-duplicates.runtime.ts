@@ -52,7 +52,7 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
   const owner = resolveForeignMemorySlotOwner(cfg);
   if (owner) {
     throw new Error(
-      `memory duplicates inspects Memory Core files, but the memory slot selects "${owner}".`,
+      `memory duplicates inspects Memory Core files, but the memory slot selects "${owner}". Use the ${owner} plugin's own commands or the agent's memory tools.`,
     );
   }
   const settings = resolveMemorySearchIndexConfig(cfg, agentId);
