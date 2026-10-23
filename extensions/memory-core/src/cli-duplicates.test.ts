@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
 import { declareAgentWorkspaceAccess } from "openclaw/plugin-sdk/agent-workspace-runtime";
+import * as memoryIndexing from "openclaw/plugin-sdk/memory-core-host-engine-indexing";
+import * as memoryStorage from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { defaultRuntime } from "openclaw/plugin-sdk/memory-core-host-runtime-cli";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
@@ -404,6 +406,62 @@ describe("memory duplicates CLI", () => {
       code: "WORKSPACE_ACCESS_UNAVAILABLE",
     });
   });
+
+  it.each(["alias/missing/nested", "alias/missing/policy.md"])(
+    "rejects missing remote root %s through an existing symlinked parent",
+    async (extra) => {
+      const remote = path.resolve(workspace, "../remote");
+      await fs.mkdir(remote);
+      await write("memory/local.md", policy);
+      await fs.symlink(remote, path.join(workspace, "alias"), "dir");
+      config.current.agents = { entries: { main: { workspace }, ops: { workspace: remote } } };
+      config.current.memory = { search: { extraPaths: [extra] } };
+      config.current.plugins = {
+        entries: {
+          "file-transfer": {
+            config: {
+              workspaces: { ops: { nodeId: "synthetic-node", remoteRoot: "/synthetic/workspace" } },
+            },
+          },
+        },
+      };
+      const json = spyRuntimeJson(defaultRuntime);
+      await expect(run("--agent", "main", "--json")).rejects.toMatchObject({
+        code: "WORKSPACE_ACCESS_UNAVAILABLE",
+      });
+      expect(json).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(workspace, "memory/local.md"), "utf8")).toBe(policy);
+    },
+  );
+
+  it.each([
+    { relative: "memory", alias: false },
+    { relative: "docs", alias: false },
+    { relative: "memory", alias: true },
+  ])(
+    "rejects declared ownership nested below $relative before reading files (alias: $alias)",
+    async ({ relative, alias }) => {
+      const staleFile = path.join(relative, "remote/policy.md");
+      await write(staleFile, policy);
+      declareAgentWorkspaceAccess(path.join(workspace, relative, "remote"));
+      let selectedWorkspace = workspace;
+      if (alias) {
+        selectedWorkspace = path.join(roots.make("openclaw-memory-nested-alias-"), "alias");
+        await fs.symlink(workspace, selectedWorkspace, "dir");
+      }
+      config.current.agents = { entries: { main: { workspace: selectedWorkspace } } };
+      config.current.memory = { search: { extraPaths: relative === "docs" ? [relative] : [] } };
+      // mock-isolation: Passthrough spies prove admission precedes the real reader and chunker.
+      const read = vi.spyOn(memoryStorage, "readMemoryFile");
+      const chunk = vi.spyOn(memoryIndexing, "chunkMarkdown");
+      const json = spyRuntimeJson(defaultRuntime);
+      await expect(run("--json")).rejects.toMatchObject({ code: "WORKSPACE_ACCESS_UNAVAILABLE" });
+      expect(read).not.toHaveBeenCalled();
+      expect(chunk).not.toHaveBeenCalled();
+      expect(json).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(workspace, staleFile), "utf8")).toBe(policy);
+    },
+  );
 
   it.each(["memory", "docs"])(
     "honors declared unavailable ownership of the %s scan root",

@@ -4,6 +4,7 @@ import {
   getAgentWorkspaceAccess,
   WorkspaceAccessUnavailableError,
 } from "openclaw/plugin-sdk/agent-workspace-runtime";
+import { resolvePathPrefixSync } from "openclaw/plugin-sdk/file-access-runtime";
 import {
   isPathInside,
   resolveAgentWorkspaceDir,
@@ -36,7 +37,8 @@ async function resolveScanPath(filePath: string): Promise<{ lexical: string; can
     if (!isFileMissingError(error)) {
       throw error;
     }
-    return { lexical, canonical: lexical };
+    const { existingPath, unresolvedSegments } = resolvePathPrefixSync(lexical);
+    return { lexical, canonical: path.join(existingPath, ...unresolvedSegments) };
   }
 }
 
@@ -104,7 +106,6 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
     }),
   );
   const workspace = await resolveScanPath(workspaceDir);
-  // Missing scan roots retain lexical aliases; the workspace can still resolve its remote owner.
   // The workspace itself is not recursively scanned, so unscanned remote descendants stay allowed.
   const configuredRemote = [{ ...workspace, recursive: false }, ...roots].some((root) =>
     remoteRoots.some((remote) =>
@@ -129,6 +130,13 @@ export async function runMemoryDuplicates(opts: MemoryDuplicatesCommandOptions):
   let skippedFiles = 0;
   const minChars = opts.minChars ?? 80;
   for (const file of files.toSorted()) {
+    // Providers can declare owners below recursive roots; admit each file before reading it.
+    const resolved = await resolveScanPath(file);
+    if ([resolved.lexical, resolved.canonical].some(hasRemoteMemoryOwner)) {
+      throw new WorkspaceAccessUnavailableError(
+        "memory duplicates requires local memory files; run it on the workspace host with a local-workspace configuration.",
+      );
+    }
     const result = await readMemoryFile({
       workspaceDir,
       extraPaths: settings.extraPaths,
