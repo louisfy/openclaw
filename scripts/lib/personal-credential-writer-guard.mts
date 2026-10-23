@@ -1,5 +1,5 @@
-import * as ts from "typescript/unstable/ast";
-import { SymbolFlags, type Symbol } from "typescript/unstable/sync";
+import * as ts from "typescript/ast";
+import { SymbolFlags, type Symbol } from "typescript/sync";
 import type { NativeTypeScriptProject } from "./native-typescript.mts";
 
 const accounts = "src/state/user-model-accounts.ts";
@@ -17,6 +17,10 @@ const personalPublication = "src/gateway/github-personal-publication-store.worke
 const repositoryPublication = "src/gateway/github-repository-publication-store.worker.ts";
 const publicationLifecycle = "src/state/github-publication-session-lifecycles.worker.ts";
 const publicationDeletion = "src/state/github-personal-publication-lifecycle.ts";
+const offlinePublicationFixture = key(
+  "scripts/bench-gateway-startup.ts",
+  "seedTeamBootPublication",
+);
 const sessionMembers = "src/config/sessions/session-sharing-store.native.ts";
 const sessionArtifacts = "src/config/sessions/session-accessor.sqlite-node-artifacts.ts";
 const sessionEntries = "src/config/sessions/session-accessor.sqlite-entry-store.ts";
@@ -47,7 +51,8 @@ const guardedTables = new Set([
   "session_members",
 ]);
 
-// Schema owners create/rebuild tables and v18 adds a column; no publication row-DML exception.
+// The startup fixture owns a newly created root before any Gateway runs; its one
+// historical shared receipt has no requester authority and cannot publish.
 const publicationWriters = new Map<string, readonly string[]>([
   [
     key(publicationLifecycle, "insertGitHubPublicationSessionLifecycle"),
@@ -64,7 +69,10 @@ const publicationWriters = new Map<string, readonly string[]>([
     ] as const
   ).map(([file, name]): [string, string[]] => [
     key(file, name),
-    [key(publicationRequestWorker, "githubPublications.insert/write")],
+    [
+      key(publicationRequestWorker, "githubPublications.insert/write"),
+      ...(file === sharedPublication ? [offlinePublicationFixture] : []),
+    ],
   ]),
   ...[
     "markSharedGitHubPublicationReportedInDatabase",
@@ -305,13 +313,19 @@ const genericCredentialCallers = new Map<string, readonly string[]>([
   ],
   [
     key(machineState, "updateConfigMachineStateInDatabase"),
-    [key(machineState, "updateConfigMachineState")],
+    [
+      key(machineState, "updateConfigMachineState"),
+      // Both receipt writers construct only automation-default: keys in their kernel.
+      ...["recordDefaultProactiveJobInDatabase", "recordConvertedProactiveJobInDatabase"].map(
+        (name) => key("src/cron/proactive-job-receipt.kernel.ts", name),
+      ),
+    ],
   ],
   // These keys are built by bounded prefixes in the reviewed owners, never copied from a command.
   [
     key(machineState, "writeConfigMachineState"),
     [
-      key("src/state/openclaw-state-worker-runtime.ts", "executeSharedStateCommand"),
+      key("src/tui/tui-last-session.kernel.ts", "tui.lastSession.write"),
       key("src/commands/doctor/shared/legacy-webhook-pins.ts", "recordUnwrittenWebhookCompletion"),
     ],
   ],
@@ -353,7 +367,7 @@ const nativeReadCallers = new Map<string, readonly string[]>([
       "extensions/codex/src/account-usage-runtime.ts:handleCodexAccountUsage/assertCurrent",
       "extensions/codex/src/app-server/auth-profile.ts:<module>",
       "extensions/codex/src/app-server/auth-profile-selection.ts:createCodexAuthProfileSelection/resolveCodexAppServerAuthProfileIdAtEffect",
-      "extensions/codex/src/command-diagnostics.ts:resolvePendingCodexDiagnosticsTargets",
+      "extensions/codex/src/command-diagnostics.ts:resolvePendingCodexDiagnosticsTarget",
       "src/agents/embedded-agent-runner/cli-backend-dispatch-eligibility.ts:resolveEmbeddedCliBackendDispatchEligibility",
       "src/agents/model-auth-label.ts:resolveModelAuthLabel",
       "src/agents/model-auth-provider.ts:resolveScopedAuthProfileStore",
@@ -412,7 +426,7 @@ const nativeReadCallers = new Map<string, readonly string[]>([
       "src/cli/capability-cli/model.ts:runModelAuthLogout",
       "src/cli/capability-cli/shared.ts:providerHasGenericConfig",
       "src/commands/doctor-auth.ts:loadAuthProfileHealth",
-      "src/commands/doctor-auth.ts:noteCopilotAmbientToken",
+      "src/commands/doctor-auth.ts:collectCopilotAmbientTokenFindings",
     ],
   ],
   [
@@ -505,7 +519,12 @@ const callers = new Map<string, readonly string[]>([
   ]),
   [
     key(sessionArtifacts, "clearSessionCollaborationForKey"),
-    [key(sessionEntries, "writeSessionEntry")],
+    [
+      key(
+        "src/config/sessions/session-accessor.sqlite-entry-write.ts",
+        "prepareSessionEntryWrite/write",
+      ),
+    ],
   ],
   [
     key(sessionArtifacts, "deleteSessionNodeArtifacts"),
@@ -572,7 +591,12 @@ const callers = new Map<string, readonly string[]>([
   ],
   [
     key(publicationDeletion, "deletePersonalGitHubSessionReceiptsInDatabase"),
-    [key("src/state/openclaw-state-worker-runtime.ts", "executeSharedStateCommand")],
+    [
+      key(
+        "src/state/github-personal-publication-lifecycle.worker.ts",
+        "githubPublication.deleteSessionReceipts",
+      ),
+    ],
   ],
   [key(accounts, "writeRecord"), [key(accounts, "writeProfile"), key(accounts, "writeLinks")]],
   [
@@ -730,9 +754,15 @@ const sinks = new Map<string, number>([
   ],
 ]);
 
+// Generated v25 migration metadata is published only by the existing schema transaction.
+const subagentRecoveryMetadataSinks = new Set([
+  key("scripts/generate-postgres-schema.mts", "generatePostgresSchemas"),
+  key("src/state/postgres-schema.generated/runtime.ts", "<module>"),
+]);
 const rawMachineStateSinks = new Map([
   [key("src/state/openclaw-state-db-schema-v12-foldin.ts", "migrateSingletonStateFoldInV12"), 1],
   [key("src/state/openclaw-state-db-schema-v13-widerow.ts", "migrateJsonCanonicalWideRowsV13"), 2],
+  ...[...subagentRecoveryMetadataSinks].map((id): [string, number] => [id, 1]),
 ]);
 
 function mayIncludeAuthKey(
@@ -1273,8 +1303,27 @@ export function inspectPersonalCredentialWriters(
           const count = (rawSinkCounts.get(id) ?? 0) + 1;
           rawSinkCounts.set(id, count);
           if (
+            id === offlinePublicationFixture &&
+            count === 1 &&
+            ts.isStringLiteralLikeNode(node) &&
+            ts.isCallExpression(node.parent) &&
+            ts.isPropertyAccessExpression(node.parent.expression) &&
+            node.parent.expression.name.text === "prepare" &&
+            node.parent.arguments.length === 1 &&
+            node.parent.arguments[0] === node &&
+            /^UPDATE github_publication_session_lifecycles SET requester_authority_json = NULL WHERE publication_kind = 'shared' AND request_id = 'startup-publication'$/u.test(
+              node.text,
+            )
+          ) {
+            continue;
+          }
+          if (
             write[1]?.toLowerCase() !== "config_machine_state" ||
-            count > (rawMachineStateSinks.get(id) ?? 0)
+            count > (rawMachineStateSinks.get(id) ?? 0) ||
+            (subagentRecoveryMetadataSinks.has(id) &&
+              !/^UPDATE config_machine_state SET value_json = '25' WHERE state_key = 'state\.schema\.contentVersion' AND value_json = '24';\s*$/u.test(
+                node.text.slice(write.index),
+              ))
           ) {
             fail(node, "raw authority-table write bypasses the reviewed writer sinks");
           }

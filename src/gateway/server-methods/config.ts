@@ -31,6 +31,7 @@ import { redactConfigObject, restoreRedactedValues } from "../../config/redact-s
 import {
   invalidateGatewayRuntimeConfigSchema,
   loadGatewayRuntimeConfigSchema,
+  loadGatewayConfigRedactionHints,
 } from "../../config/runtime-schema.js";
 import { lookupConfigSchema } from "../../config/schema.js";
 import { projectRuntimeChangesOntoSource } from "../../config/source-value-projection.js";
@@ -89,7 +90,7 @@ import {
 } from "./open-path.js";
 import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
 import type { GatewayRequestContext, GatewayRequestHandlers, RespondFn } from "./types.js";
-import { assertValidParams } from "./validation.js";
+import { assertValidParams, defineValidatedGatewayHandler } from "./validation.js";
 
 const configWriteRecovery = new WeakMap<
   GatewayConfigRevisionProjector,
@@ -394,8 +395,8 @@ async function prepareConfigReplacementOrRespond(
     respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, parsedRes.error));
     return null;
   }
-  const schema = loadGatewayRuntimeConfigSchema();
-  const restored = restoreRedactedValues(parsedRes.parsed, snapshot.config, schema.uiHints);
+  const uiHints = loadGatewayConfigRedactionHints();
+  const restored = restoreRedactedValues(parsedRes.parsed, snapshot.config, uiHints);
   if (!restored.ok) {
     respond(
       false,
@@ -423,7 +424,7 @@ async function prepareConfigReplacementOrRespond(
     writeSnapshot,
     config: validatedSubmission.config,
     writeConfig: validatedSubmission.validationCandidate,
-    schema,
+    uiHints,
   };
 }
 
@@ -693,7 +694,6 @@ export const configHandlers: GatewayRequestHandlers = {
     const recoveryAtStart = configWriteRecovery.get(gateway);
     const snapshot = await readConfigGetResponse({
       getHotReloadStatus: context.getConfigReloaderHotReloadStatus,
-      loadUiHints: () => loadGatewayRuntimeConfigSchema().uiHints,
       revisionProjector: context.configRevisionProjector,
     });
     const recovery = configWriteRecovery.get(gateway);
@@ -714,25 +714,24 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     respond(true, loadGatewayRuntimeConfigSchema(), undefined);
   },
-  "config.schema.lookup": ({ params, respond }) => {
-    if (
-      !assertValidParams(params, validateConfigSchemaLookupParams, "config.schema.lookup", respond)
-    ) {
-      return;
-    }
-    const { path } = params;
-    const schema = loadGatewayRuntimeConfigSchema();
-    const result = lookupConfigSchema(schema, path, resolveConfigReloadMetadata);
-    if (!result) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "config schema path not found"),
-      );
-      return;
-    }
-    respond(true, result, undefined);
-  },
+  "config.schema.lookup": defineValidatedGatewayHandler(
+    "config.schema.lookup",
+    validateConfigSchemaLookupParams,
+    ({ params, respond }) => {
+      const { path } = params;
+      const schema = loadGatewayRuntimeConfigSchema();
+      const result = lookupConfigSchema(schema, path, resolveConfigReloadMetadata);
+      if (!result) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "config schema path not found"),
+        );
+        return;
+      }
+      respond(true, result, undefined);
+    },
+  ),
   "config.set": async ({ params, respond, context }) => {
     if (!assertValidParams(params, validateConfigSetParams, "config.set", respond)) {
       return;
@@ -782,7 +781,7 @@ export const configHandlers: GatewayRequestHandlers = {
         ...(writeResult.hash
           ? { hash: context.configRevisionProjector.projectRawHash(writeResult.hash) }
           : {}),
-        config: redactConfigObject(writeResult.config, parsed.schema.uiHints),
+        config: redactConfigObject(writeResult.config, parsed.uiHints),
         ...preparedSecretDegradationPayload(preparedSecretsSnapshot),
       },
       undefined,
@@ -870,8 +869,8 @@ export const configHandlers: GatewayRequestHandlers = {
       mergeObjectArraysById: true,
       replaceArrayPaths: replacePaths,
     });
-    const schemaPatch = loadGatewayRuntimeConfigSchema();
-    const restoredMerge = restoreRedactedValues(mergedSource, snapshot.config, schemaPatch.uiHints);
+    const uiHints = loadGatewayConfigRedactionHints();
+    const restoredMerge = restoreRedactedValues(mergedSource, snapshot.config, uiHints);
     if (!restoredMerge.ok) {
       respond(
         false,
@@ -924,7 +923,7 @@ export const configHandlers: GatewayRequestHandlers = {
           changedPaths: [],
           path: resolveGatewayConfigPath(snapshot),
           ...(params.response !== "summary"
-            ? { config: redactConfigObject(snapshot.config, schemaPatch.uiHints) }
+            ? { config: redactConfigObject(snapshot.config, uiHints) }
             : {}),
         },
         undefined,
@@ -948,6 +947,17 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!preparedSecretsSnapshot) {
       return;
     }
+    // Only explicit keyed nulls populate the writer's roster-removal grant.
+    const allowedAgentRosterRemovals: string[] = [];
+    const sourceEntries = sourceConfig.agents?.entries;
+    const patchEntries = normalizedPatch.agents?.entries;
+    if (!hashlessPatch && sourceEntries && patchEntries) {
+      for (const [id, entry] of Object.entries(patchEntries)) {
+        if (entry === null && Object.hasOwn(sourceEntries, id)) {
+          allowedAgentRosterRemovals.push(id);
+        }
+      }
+    }
     await commitConfigRestartWrite({
       requestParams: params,
       mode: "config.patch",
@@ -955,8 +965,11 @@ export const configHandlers: GatewayRequestHandlers = {
         ...writeSnapshot,
         writeOptions: {
           ...writeOptions,
-          assertCurrent: () => {
-            writeOptions.assertCurrent?.();
+          allowedAgentRosterRemovals,
+          // The committed policy may revoke this requester before canonical reread.
+          // Admit publication synchronously; retain the writer's own guards through completion.
+          assertBeforePublish: () => {
+            writeOptions.assertBeforePublish?.();
             authority.assertCurrent();
           },
         },
@@ -966,7 +979,7 @@ export const configHandlers: GatewayRequestHandlers = {
       actor,
       context,
       respond,
-      uiHints: schemaPatch.uiHints,
+      uiHints,
       preparedSecretsSnapshot,
       summary: params.response === "summary",
     });
@@ -1000,7 +1013,7 @@ export const configHandlers: GatewayRequestHandlers = {
       actor,
       context,
       respond,
-      uiHints: parsed.schema.uiHints,
+      uiHints: parsed.uiHints,
       preparedSecretsSnapshot,
     });
   },

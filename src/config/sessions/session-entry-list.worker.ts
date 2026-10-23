@@ -1,26 +1,18 @@
-import { jsonExtractText } from "../../infra/database-engine/json-values.js";
+import { jsonExtractText, jsonPathValue } from "../../infra/database-engine/json-values.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
 import { sqlPublicationAnchor } from "../../infra/sql-connection.js";
 import { withSqlitePostCommitPublications } from "../../infra/sqlite-post-commit.js";
-import {
-  runSqliteDeferredTransactionSync,
-  runSqliteReadSnapshotSync,
-} from "../../infra/sqlite-transaction.js";
+import { runSqliteReadSnapshotSync } from "../../infra/sqlite-transaction.js";
 import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db-identity.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import { hasSessionPendingInputsSchema } from "../../state/openclaw-agent-pending-inputs-schema.js";
 import { cloneEnvWithPlatformSemantics } from "../config-env-vars.js";
-import { matchesPluginHostCleanupSession } from "./plugin-host-cleanup.js";
-import {
-  listSqliteSessionEntriesFromDatabase,
-  readSelectedSessionEntriesInDatabase,
-} from "./session-accessor.sqlite-entry-list.read.js";
 import {
   cacheValidityTokensEqual,
   readSessionEntryCacheValidityToken,
 } from "./session-accessor.sqlite-entry-revision.js";
-import { resolveSqliteScope } from "./session-accessor.sqlite-scope.js";
+import { readSelectedSessionEntriesInDatabase } from "./session-accessor.sqlite-entry-selected.read.js";
 import { readWithCanonicalSessionReaderContinuation } from "./session-canonical-key.js";
 import { captureSessionEntryReadSource } from "./session-entry-read-source.js";
 import type {
@@ -29,13 +21,28 @@ import type {
 } from "./session-entry-read.types.js";
 
 /** Cleanup selects identity columns before materializing metadata in the same worker snapshot. */
-export function readSessionEntryList(
+export async function readSessionEntryList(
   request: SessionEntryListWorkerInput,
-): Omit<SessionEntryListWorkerResult, "kind"> {
+): Promise<Omit<SessionEntryListWorkerResult, "kind">> {
   const scope = {
     ...request.scope,
     env: cloneEnvWithPlatformSemantics(request.scope.env ?? process.env),
   };
+  // Prepare optional command code before entering the synchronous reader snapshot.
+  const recovery =
+    scope.mainSessionRecovery || scope.pendingExecRecovery || scope.pendingInputRecovery;
+  const listing =
+    recovery || scope.cleanupSession !== undefined
+      ? undefined
+      : await import("./session-accessor.sqlite-entry-list.read.js");
+  const resolveScope = listing
+    ? (await import("./session-accessor.sqlite-scope.js")).resolveSqliteScope
+    : undefined;
+  const mainRecovery = scope.mainSessionRecovery
+    ? await import("./restart-recovery-state.js")
+    : undefined;
+  const cleanup =
+    scope.cleanupSession === undefined ? undefined : await import("./plugin-host-cleanup.js");
   let source: SessionEntryListWorkerResult["source"];
   let revision: string | undefined;
   let unchanged: true | undefined;
@@ -47,6 +54,65 @@ export function readSessionEntryList(
     (database) =>
       readWithCanonicalSessionReaderContinuation(database, request.continuation, () => {
         source = captureSessionEntryReadSource(database, request.expectedIdentity);
+        if (scope.mainSessionRecovery) {
+          const keys = executeSqliteQuerySync(
+            database.db,
+            getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db)
+              .selectFrom("session_nodes")
+              .select("session_key")
+              .where("archived_at", "is", null)
+              .where((eb) =>
+                eb(
+                  jsonPathValue(
+                    database.db,
+                    eb.ref("entry_json"),
+                    eb.val("$.mainRestartRecovery.tombstone"),
+                  ),
+                  "is",
+                  null,
+                ),
+              )
+              .where((eb) =>
+                eb.or([
+                  ...[
+                    "mainRestartRecovery",
+                    "restartRecoveryRuns",
+                    "restartRecoveryDeliveryRunId",
+                    "pendingFinalDelivery",
+                  ].map((field) =>
+                    eb(jsonExtractText(database.db, eb.ref("entry_json"), field), "is not", null),
+                  ),
+                  ...(scope.mainSessionRecovery === "orphans"
+                    ? [
+                        eb(
+                          eb.cast<string>(
+                            jsonExtractText(database.db, eb.ref("entry_json"), "abortedLastRun"),
+                            "text",
+                          ),
+                          "in",
+                          ["1", "true"],
+                        ),
+                        eb(
+                          jsonExtractText(database.db, eb.ref("entry_json"), "status"),
+                          "=",
+                          "interrupted",
+                        ),
+                      ]
+                    : []),
+                ]),
+              ),
+          ).rows.map((row) => row.session_key);
+          // Terminal run fences alone are not custody; completed rows with remaining claims still settle.
+          // Startup still validates pending canonical rows even when no orphan needs recovery.
+          return keys.length || scope.mainSessionRecovery === "orphans"
+            ? readSelectedSessionEntriesInDatabase(database, keys).filter(
+                ({ entry, sessionKey }) =>
+                  scope.mainSessionRecovery === "orphans"
+                    ? mainRecovery!.hasOrphanedMainSessionWork(entry, sessionKey)
+                    : mainRecovery!.hasMainSessionRecoveryClaim(entry),
+              )
+            : [];
+        }
         if (scope.pendingExecRecovery) {
           const page = scope.pendingExecRecovery;
           const keys = executeSqliteQuerySync(
@@ -86,15 +152,31 @@ export function readSessionEntryList(
               .distinct()
               .where("input.consumed_event_id", "is", null)
               // Queued inputs without live custody become interrupted in the history owner.
-              .where("input.state", "in", ["queued", "interrupted"]),
+              .where("input.state", "in", ["queued", "interrupted"])
+              .where((eb) =>
+                eb.or([
+                  eb("input.state", "=", "queued"),
+                  ...["sessionSendDelivery", "chatInputRecovery"].map((field) =>
+                    eb(
+                      jsonPathValue(
+                        database.db,
+                        eb.ref("input.message_json"),
+                        eb.val(`$.__openclaw.${field}`),
+                      ),
+                      "is not",
+                      null,
+                    ),
+                  ),
+                ]),
+              ),
           ).rows.map((row) => row.session_key);
           return keys.length ? readSelectedSessionEntriesInDatabase(database, keys) : [];
         }
         if (scope.cleanupSession === undefined) {
           const read = () =>
-            listSqliteSessionEntriesFromDatabase(
+            listing!.listSqliteSessionEntriesFromDatabase(
               database,
-              resolveSqliteScope({ ...scope, sessionKey: "" }),
+              resolveScope!({ ...scope, sessionKey: "" }),
               scope,
               {
                 captureCronRunUpdatedAt: (value) => (nextCronRunUpdatedAt = value),
@@ -135,7 +217,7 @@ export function readSessionEntryList(
           return entries;
         }
         return withSqlitePostCommitPublications(sqlPublicationAnchor(database.db), () =>
-          runSqliteDeferredTransactionSync(database.db, () => {
+          runSqliteReadSnapshotSync(database.db, () => {
             const identities = executeSqliteQuerySync(
               database.db,
               getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db)
@@ -145,7 +227,7 @@ export function readSessionEntryList(
             ).rows;
             const keys = identities
               .filter((row) =>
-                matchesPluginHostCleanupSession(row.sessionKey, row, scope.cleanupSession),
+                cleanup!.matchesPluginHostCleanupSession(row.sessionKey, row, scope.cleanupSession),
               )
               .map((row) => row.sessionKey);
             const entries = new Map(

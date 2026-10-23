@@ -1,5 +1,10 @@
 import { racePromiseWithAbortSignal } from "@openclaw/retry";
 import { t } from "../../../i18n/index.ts";
+import { registerChatComposerEnglish } from "../../../i18n/locales/en-chat-composer.ts";
+import { UserFacingError } from "../../../lib/format-error.ts";
+import { listen } from "../../../lib/reactive/listener.ts";
+
+registerChatComposerEnglish();
 
 export type RealtimeTalkInputDevice = {
   deviceId: string;
@@ -101,8 +106,7 @@ export function observeRealtimeTalkDevices(onChange: () => void): () => void {
   if (!devices?.addEventListener) {
     return () => undefined;
   }
-  devices.addEventListener("devicechange", onChange);
-  return () => devices.removeEventListener("devicechange", onChange);
+  return listen(devices, "devicechange", onChange);
 }
 
 export function describeRealtimeTalkInputError(error: unknown): string {
@@ -221,7 +225,7 @@ async function openRealtimeTalkMedia(
     );
   }
   const deviceId = selectedDeviceId?.trim();
-  let acquisition: MediaStream | string;
+  let acquisition: MediaStream;
   try {
     acquisition = await awaitRealtimeTalkMediaRequest(
       () =>
@@ -254,11 +258,9 @@ async function openRealtimeTalkMedia(
         ? new RealtimeTalkSelectedMicrophoneError()
         : new Error(t("chat.composer.selectedCameraUnavailable"));
     }
-    acquisition = realtimeTalkDeviceIssueMessage(deviceIssueFromError(error), kind);
-  }
-  // A DOMException cause would append its legacy code in the shared formatter.
-  if (typeof acquisition === "string") {
-    throw new Error(acquisition);
+    throw new UserFacingError(realtimeTalkDeviceIssueMessage(deviceIssueFromError(error), kind), {
+      cause: error,
+    });
   }
   if (signal?.aborted) {
     acquisition.getTracks().forEach((track) => track.stop());
@@ -267,7 +269,8 @@ async function openRealtimeTalkMedia(
   return acquisition;
 }
 
-export class RealtimeTalkInputController {
+// Owns microphone acquisition; stop aborts track listeners and releases late permission results.
+export class RealtimeTalkInputOwner {
   private controller: AbortController | null = null;
   private media: MediaStream | null = null;
 
@@ -316,7 +319,7 @@ export class RealtimeTalkInputController {
         this.onEnded(t("chat.composer.microphoneStopped"));
       };
       for (const track of media.getTracks()) {
-        track.addEventListener("ended", onEnded, { signal: controller.signal });
+        listen(track, "ended", onEnded, { signal: controller.signal });
       }
       // Only the current, successful acquisition advances the visible startup phase.
       // Cancellation must not overwrite idle or a replacement's microphone prompt.

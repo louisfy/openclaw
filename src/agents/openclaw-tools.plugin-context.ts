@@ -15,6 +15,7 @@ export type OpenClawPluginToolOptions = Pick<
   | "agentSessionKey"
   | "runSessionKey"
   | "runId"
+  | "inputProvenance"
   | "assertInvocationCurrent"
   | "assertInputCommitAllowed"
   | "agentChannel"
@@ -32,6 +33,7 @@ export type OpenClawPluginToolOptions = Pick<
   | "fsPolicy"
   | "modelProvider"
   | "modelId"
+  | "modelContextWindowTokens"
   | "requesterSenderId"
   | "senderIsOwner"
   | "memoryAudience"
@@ -46,6 +48,10 @@ export type OpenClawPluginToolOptions = Pick<
   | "sandboxed"
   | "allowGatewaySubagentBinding"
   | "toolBindings"
+  | "sandbox"
+  | "abortSignal"
+  | "pluginExecutionSkillsSnapshot"
+  | "pluginExecutionAuthority"
 > & { activeProjectKeys?: readonly string[]; approvalReviewerDeviceId?: string };
 
 export function resolveOpenClawPluginToolInputs(params: {
@@ -100,6 +106,8 @@ export function resolveOpenClawPluginToolInputs(params: {
       agentId: sessionAgentId,
       sessionKey,
       sessionId: options?.sessionId,
+      runId: options?.runId,
+      inputProvenance: options?.inputProvenance,
       approvalReviewerDeviceIds: options?.approvalReviewerDeviceIds
         ? [...options.approvalReviewerDeviceIds]
         : options?.approvalReviewerDeviceId

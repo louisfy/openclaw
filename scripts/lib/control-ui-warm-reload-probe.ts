@@ -5,7 +5,39 @@ export function warmReloadProbe() {
   const shifts: Array<{ at: number; value: number }> = [];
   const states: Array<{ at: number; state: string }> = [];
   const reads: Array<{ at: number; store: string; hit: boolean }> = [];
+  const transactions: Array<{
+    at: number;
+    label: string;
+    rows: number;
+    sidebarRows: number;
+    boardFrames: number;
+  }> = [];
   const rows = new Set<Element>();
+  const sidebarFrames: Array<{
+    at: number;
+    cached: boolean;
+    rowIds: string[];
+    orderHash: number;
+    headers: string[];
+    avatars: string[];
+    retained: number;
+  }> = [];
+  let cachedSidebarRows: Element[] = [];
+  type ElementPaint = PerformanceEntry & {
+    identifier: string;
+    renderTime: number;
+    intersectionRect: DOMRectReadOnly;
+    element: Element | null;
+  };
+  const transcriptPaints: Array<{ renderTime: number; element: string; rowKey: string | null }> =
+    [];
+  const largestPaints: Array<{
+    renderTime: number;
+    loadTime: number;
+    size: number;
+    element: string | null;
+    transcript: boolean;
+  }> = [];
   let removedRows = 0;
   let stopped = false;
   let cachedRows: Element[] = [];
@@ -24,6 +56,43 @@ export function warmReloadProbe() {
       milestones[entry.name] = entry.startTime;
     }
   });
+  const elementLabel = (element: Element) =>
+    `${element.localName}${element.classList.length ? `.${[...element.classList].join(".")}` : ""}`;
+  observe("element", (entries) => {
+    for (const entry of entries) {
+      // Element Timing is implemented by Chromium but absent from lib.dom.
+      const paint = entry as ElementPaint;
+      const row = paint.element?.closest(".chat-virtual-row");
+      if (
+        paint.identifier !== "openclaw-transcript" ||
+        !row ||
+        !paint.element ||
+        paint.renderTime <= 0 ||
+        paint.intersectionRect.width <= 0 ||
+        paint.intersectionRect.height <= 0
+      ) {
+        continue;
+      }
+      milestones.firstTranscriptPaint ??= paint.renderTime;
+      transcriptPaints.push({
+        renderTime: paint.renderTime,
+        element: elementLabel(paint.element),
+        rowKey: row.getAttribute("data-virtual-row-key"),
+      });
+    }
+  });
+  observe("largest-contentful-paint", (entries) => {
+    for (const entry of entries) {
+      const paint = entry as LargestContentfulPaint;
+      largestPaints.push({
+        renderTime: paint.renderTime,
+        loadTime: paint.loadTime,
+        size: paint.size,
+        element: paint.element ? elementLabel(paint.element) : null,
+        transcript: Boolean(paint.element?.closest(".chat-virtual-row")),
+      });
+    }
+  });
   observe("layout-shift", (entries) => {
     for (const entry of entries) {
       if (!Reflect.get(entry, "hadRecentInput")) {
@@ -31,10 +100,38 @@ export function warmReloadProbe() {
       }
     }
   });
+  // Correlate completion tasks with their actual cache owner in diagnostic traces.
+  const databasePrototype: {
+    transaction: (
+      this: IDBDatabase,
+      ...args: Parameters<IDBDatabase["transaction"]>
+    ) => ReturnType<IDBDatabase["transaction"]>;
+  } = IDBDatabase.prototype;
+  const transaction = databasePrototype.transaction;
+  IDBDatabase.prototype.transaction = function (this: IDBDatabase, ...args) {
+    const result = transaction.apply(this, args);
+    const label = `${this.name}:${[...result.objectStoreNames].join(",")}:${result.mode}`;
+    result.addEventListener("complete", () => {
+      performance.mark(`warm-idb:${label}`);
+      transactions.push({
+        at: performance.now(),
+        label,
+        rows: document.querySelectorAll(".chat-virtual-row").length,
+        sidebarRows: document.querySelectorAll(".sidebar-recent-session").length,
+        boardFrames: document.querySelectorAll(".board-widget__frame").length,
+      });
+    });
+    return result;
+  };
   // Preserve the native method so each probe call can pass its actual store as this.
-  // oxlint-disable-next-line typescript/unbound-method
-  const get = IDBObjectStore.prototype.get;
-  IDBObjectStore.prototype.get = function (...args) {
+  const storePrototype: {
+    get: (
+      this: IDBObjectStore,
+      query: IDBValidKey | IDBKeyRange,
+    ) => ReturnType<IDBObjectStore["get"]>;
+  } = IDBObjectStore.prototype;
+  const get = storePrototype.get;
+  IDBObjectStore.prototype.get = function (this: IDBObjectStore, ...args) {
     const request = get.apply(this, args);
     const store = this.name;
     request.addEventListener("success", () => {
@@ -48,7 +145,9 @@ export function warmReloadProbe() {
   const Original = window.WebSocket;
   window.WebSocket = new Proxy(Original, {
     construct(target, args) {
+      mark("socketCreated");
       const socket: WebSocket = Reflect.construct(target, args);
+      socket.addEventListener("open", () => mark("socketOpen"), { once: true });
       const pending = new Map<string, string>();
       const send = socket.send.bind(socket);
       socket.send = (data) => {
@@ -56,6 +155,11 @@ export function warmReloadProbe() {
           const frame = JSON.parse(data);
           if (frame.type === "req") {
             pending.set(frame.id, frame.method);
+            if (frame.method === "connect") {
+              mark("connectSent");
+            } else if (milestones.hello !== undefined) {
+              mark("firstPostHelloRpc");
+            }
           }
         }
         send(data);
@@ -78,6 +182,7 @@ export function warmReloadProbe() {
   });
   const observer = new MutationObserver((records) => {
     const regions = new Map<string, number>();
+    const textRoots = new Set<Element>();
     for (const record of records) {
       const element =
         record.target instanceof Element ? record.target : record.target.parentElement;
@@ -87,6 +192,21 @@ export function warmReloadProbe() {
         ? "transcript"
         : (element?.closest("openclaw-chat-pane, openclaw-app-sidebar")?.localName ?? "shell");
       regions.set(region, (regions.get(region) ?? 0) + 1);
+      const textRoot = element?.closest(".chat-text");
+      if (textRoot) {
+        textRoots.add(textRoot);
+      }
+      for (const node of record.addedNodes) {
+        if (!(node instanceof Element)) {
+          continue;
+        }
+        if (node.matches(".chat-text")) {
+          textRoots.add(node);
+        }
+        for (const root of node.querySelectorAll(".chat-text")) {
+          textRoots.add(root);
+        }
+      }
       for (const node of record.removedNodes) {
         if (!(node instanceof Element)) {
           continue;
@@ -98,6 +218,21 @@ export function warmReloadProbe() {
           if (rows.has(row)) {
             removedRows++;
           }
+        }
+      }
+    }
+    // Tag direct text owners before paint. A row/container attribute does not
+    // cover descendant block text, and a DOM/rAF timestamp is not presentation.
+    for (const root of textRoots) {
+      if (!root.closest(".chat-virtual-row")) {
+        continue;
+      }
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let text: Node | null;
+      while ((text = walker.nextNode())) {
+        const parent = text.parentElement;
+        if (text.textContent?.trim() && parent && !parent.hasAttribute("elementtiming")) {
+          parent.setAttribute("elementtiming", "openclaw-transcript");
         }
       }
     }
@@ -114,6 +249,35 @@ export function warmReloadProbe() {
   const sample = () => {
     if (stopped) {
       return;
+    }
+    const sidebar = document.querySelector("aside.sidebar");
+    if (sidebar || sidebarFrames.length) {
+      const sidebarRows = [
+        ...(sidebar?.querySelectorAll(".sidebar-session-content .sidebar-recent-session") ?? []),
+      ];
+      const cached = sidebar?.getAttribute("data-snapshot-state") === "cached";
+      if (cached && !cachedSidebarRows.length) {
+        cachedSidebarRows = sidebarRows;
+      }
+      const rowIds = sidebarRows.map((row) => row.getAttribute("data-session-key") ?? "");
+      let orderHash = 2166136261;
+      for (const character of rowIds.join("\0")) {
+        orderHash = Math.imul(orderHash ^ character.charCodeAt(0), 16777619) >>> 0;
+      }
+      sidebarFrames.push({
+        at: performance.now(),
+        cached,
+        rowIds,
+        orderHash,
+        headers: [...(sidebar?.querySelectorAll("[data-session-section]") ?? [])].map(
+          (section) =>
+            `${section.getAttribute("data-session-section")}:${section.querySelector(".sidebar-session-group-toggle")?.getAttribute("aria-label") ?? ""}`,
+        ),
+        avatars: sidebarRows.map((row) =>
+          [...row.querySelectorAll("img")].map((img) => img.getAttribute("src") ?? "").join("|"),
+        ),
+        retained: cachedSidebarRows.filter((row) => row.isConnected).length,
+      });
     }
     const pane = document.querySelector(".chat-pane-cache__pane--active");
     const thread = pane?.querySelector(".chat-thread");
@@ -164,13 +328,18 @@ export function warmReloadProbe() {
       const perf = Reflect.get(window, "__perf");
       return {
         milestones,
+        measures: performance.getEntriesByType("measure").map((entry) => entry.toJSON()),
+        transcriptPaints,
+        largestPaints,
         reads,
+        transactions,
         shifts,
         cls: shifts.reduce((sum, shift) => sum + shift.value, 0),
         lastLayoutShift: shifts.at(-1)?.at ?? null,
         lastMutationBurst: mutations.findLast((batch) => batch.count >= 10)?.at ?? null,
         mutations,
         states,
+        sidebarFrames,
         rows: {
           mounted: rows.size,
           removed: removedRows,

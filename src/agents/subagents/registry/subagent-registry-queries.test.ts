@@ -10,8 +10,6 @@ import { subagentRuns } from "./subagent-registry-memory.js";
 import {
   buildSubagentRunReadIndexFromRuns,
   countActiveRunsForSessionFromRuns,
-  countPendingDescendantRunsFromRuns,
-  hasDescendantRunAwaitingSettleFromRuns,
   listRunsForRequesterFromRuns,
   getLatestSubagentRunByChildSessionKeyFromRuns,
   shouldIgnorePostCompletionAnnounceForSessionFromRuns,
@@ -407,23 +405,19 @@ describe("hasDescendantRunAwaitingSettleFromRuns", () => {
     const runs = toRunMap([parent, descendant]);
 
     expect(
-      hasDescendantRunAwaitingSettleFromRuns(
-        runs,
+      buildSubagentRunReadIndexFromRuns({ runs }).hasDescendantRunAwaitingSettle(
         requester,
-        undefined,
-        undefined,
         undefined,
         batchCreatedAt,
       ),
     ).toBe(true);
-    expect(countPendingDescendantRunsFromRuns(runs, requester)).toBe(2);
+    expect(buildSubagentRunReadIndexFromRuns({ runs }).countPendingDescendantRuns(requester)).toBe(
+      2,
+    );
     expect(
-      hasDescendantRunAwaitingSettleFromRuns(
-        runs,
+      buildSubagentRunReadIndexFromRuns({ runs }).hasDescendantRunAwaitingSettle(
         requester,
         descendant.runId,
-        undefined,
-        undefined,
         batchCreatedAt,
       ),
     ).toBe(false);

@@ -14,7 +14,6 @@ import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk/channel-send-re
 import { PAIRING_APPROVED_MESSAGE } from "openclaw/plugin-sdk/channel-status";
 import { buildPassiveProbedChannelStatusSummary } from "openclaw/plugin-sdk/extension-shared";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
-import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
 import { chunkMarkdownText } from "openclaw/plugin-sdk/reply-runtime";
 import { buildOutboundBaseSessionKey } from "openclaw/plugin-sdk/routing";
 import {
@@ -132,9 +131,6 @@ function toIMessageMessageSendResult(
 
 const loadIMessageApprovalReactionsModule = createLazyRuntimeModule(
   () => import("./approval-reactions.js"),
-);
-const loadIMessageQuestionReactionsModule = createLazyRuntimeModule(
-  () => import("./question-reactions.js"),
 );
 
 const imessageMessageAdapter = defineChannelMessageAdapter({
@@ -264,28 +260,6 @@ async function resolveIMessageConversationTarget(params: {
   };
 }
 
-async function resolveIMessageOutboundSessionRoute(
-  params: Parameters<typeof resolveIMessageConversationTarget>[0] & { agentId: string },
-) {
-  const target = await resolveIMessageConversationTarget(params);
-  if (!target) {
-    return null;
-  }
-  const { accountId, ...route } = target;
-  const baseSessionKey = buildOutboundBaseSessionKey({
-    ...params,
-    accountId,
-    channel: "imessage",
-    peer: route.peer,
-  });
-  return {
-    sessionKey: baseSessionKey,
-    baseSessionKey,
-    ...route,
-    chatType: route.peer.kind,
-  };
-}
-
 export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProbe, unknown, 2> =
   createChatChannelPlugin<ResolvedIMessageAccount, IMessageProbe, unknown, 2>({
     base: {
@@ -340,7 +314,25 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
       messaging: {
         normalizeTarget: normalizeIMessageMessagingTarget,
         inferTargetChatType: ({ to }) => inferIMessageTargetChatType(to),
-        resolveOutboundSessionRoute: resolveIMessageOutboundSessionRoute,
+        resolveOutboundSessionRoute: async (params) => {
+          const target = await resolveIMessageConversationTarget(params);
+          if (!target) {
+            return null;
+          }
+          const { accountId, ...route } = target;
+          const baseSessionKey = buildOutboundBaseSessionKey({
+            ...params,
+            accountId,
+            channel: "imessage",
+            peer: route.peer,
+          });
+          return {
+            sessionKey: baseSessionKey,
+            baseSessionKey,
+            ...route,
+            chatType: route.peer.kind,
+          };
+        },
         targetResolver: {
           looksLikeId: looksLikeIMessageExplicitTargetId,
           hint: "<phone|email|chat_id:ID|auto:contact|imessage:contact|sms:contact>",
@@ -491,14 +483,9 @@ export const imessagePlugin: ChannelPlugin<ResolvedIMessageAccount, IMessageProb
             Object.assign(payload, prepared);
           }
         },
-        renderPresentation: ({ payload, presentation }) =>
-          questionGatewayRuntime.prepareReactionPayloadForDelivery({ payload, presentation }),
         afterDeliverPayload: async ({ cfg, target, payload, results }) => {
           const accountId = resolveIMessageAccount({ cfg, accountId: target.accountId }).accountId;
           const delivery = { accountId, target, payload, results };
-          (
-            await loadIMessageQuestionReactionsModule()
-          ).registerIMessageQuestionReactionTargetForDeliveredPayload(delivery);
           await (
             await loadIMessageApprovalReactionsModule()
           ).registerIMessageApprovalReactionTargetForDeliveredPayload(delivery);

@@ -128,6 +128,7 @@ vi.mock("./config-model-validation.js", () => ({
   checkTouchedTextModelRefs: (...args: unknown[]) => mockCheckTouchedTextModelRefs(...args),
 }));
 
+// mock-isolation: CLI output tests use fixed policy; Gateway reload tests cover policy decisions.
 vi.mock("../gateway/config-reload-plan.js", () => ({
   buildGatewayReloadPlan: (changedPaths: string[]) => {
     const hotReasons = changedPaths.filter(
@@ -147,7 +148,6 @@ vi.mock("../gateway/config-reload-plan.js", () => ({
       reloadHooks: false,
       restartGmailWatcher: false,
       restartCron: false,
-      restartHeartbeat: hotReasons.length > 0,
       reloadPlugins: false,
       restartChannels: new Set(),
       disposeMcpRuntimes: false,
@@ -534,6 +534,9 @@ describe("config cli", () => {
 
       expect(mockWriteConfigFile).not.toHaveBeenCalled();
       expectErrorIncludes("Refusing to replace agents.defaults.models");
+      expectErrorIncludes(
+        "Use --merge to merge object values or --replace to replace intentionally.",
+      );
     });
 
     it("rejects an absent expectation when a SecretRef redirects away from the caller path", async () => {
@@ -1469,26 +1472,6 @@ describe("config cli", () => {
         ],
       });
       expect(mockWriteConfigFile).not.toHaveBeenCalled();
-    });
-
-    it("submits only the specified roster entry removal for writer validation", async () => {
-      const resolved: OpenClawConfig = {
-        agents: {
-          entries: { "agent-a": {}, "agent-b": {}, "agent-c": {} },
-        },
-      };
-      const runtimeMerged: OpenClawConfig = {
-        ...withRuntimeDefaults(resolved),
-      };
-      setSnapshot(resolved, runtimeMerged);
-
-      await runConfigCommand(["config", "unset", "agents.list[1]"]);
-
-      expect(mockWriteConfigFile).toHaveBeenCalledTimes(1);
-      const written = firstWrittenConfig();
-      // The real writer's roster-loss guard is exercised by config-cli.integration.test.ts.
-      expect(written.agents?.entries).toEqual({ "agent-a": {}, "agent-c": {} });
-      expect(firstWriteConfigOptions()).toEqual({ auditOrigin: "cli", observe: false });
     });
   });
 

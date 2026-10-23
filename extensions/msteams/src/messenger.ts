@@ -1,9 +1,5 @@
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
-import {
-  isSilentReplyText,
-  SILENT_REPLY_TOKEN,
-  type ChunkMode,
-} from "openclaw/plugin-sdk/reply-chunking";
+import type { ChunkMode } from "openclaw/plugin-sdk/reply-chunking";
 import {
   resolveSendableOutboundReplyParts,
   type ReplyPayload,
@@ -33,8 +29,12 @@ import {
   isLocalPath,
   MSTEAMS_MAX_MEDIA_BYTES,
 } from "./media-helpers.js";
-import { buildMSTeamsMessageActivity } from "./message-activity.js";
+import {
+  buildMSTeamsAdaptiveCardActivity,
+  buildMSTeamsMessageActivity,
+} from "./message-activity.js";
 import { setPendingUploadActivityId } from "./pending-uploads.js";
+import { buildMSTeamsPresentationCard } from "./presentation.js";
 import { getMSTeamsRuntime } from "./runtime.js";
 import { sendMSTeamsActivityWithReference } from "./sdk-proactive.js";
 import type { MSTeamsActivityLike } from "./sdk-types.js";
@@ -58,6 +58,7 @@ type MSTeamsReplyRenderOptions = {
 export type MSTeamsRenderedMessage = {
   text?: string;
   mediaUrl?: string;
+  adaptiveCard?: Record<string, unknown>;
 };
 
 const MSTEAMS_SEND_ATTEMPTS = 3;
@@ -78,7 +79,7 @@ export function buildConversationReference(ref: StoredConversationReference) {
     throw new Error("Invalid stored reference: missing conversation.id");
   }
   // Legacy imported rows may only carry `bot`; see StoredConversationReference.bot.
-  const agent = ref.agent ?? ref.bot ?? undefined;
+  const agent = ref.agent ?? ref.bot;
   if (agent == null || !agent.id) {
     throw new Error("Invalid stored reference: missing agent.id");
   }
@@ -122,7 +123,7 @@ export function renderReplyPayloadsToMessages(
       text: formatMSTeamsMarkdown(payload.text ?? "", options.tableMode),
     });
 
-    if (!reply.hasContent) {
+    if (!reply.hasContent && !payload.presentation) {
       continue;
     }
 
@@ -134,118 +135,20 @@ export function renderReplyPayloadsToMessages(
       );
       for (const chunk of chunks) {
         const text = chunk.trim();
-        if (text && !isSilentReplyText(text, SILENT_REPLY_TOKEN)) {
+        if (text) {
           out.push({ text });
         }
       }
+    }
+    if (payload.presentation) {
+      out.push({
+        adaptiveCard: buildMSTeamsPresentationCard({ presentation: payload.presentation }),
+      });
     }
     out.push(...reply.mediaUrls.map((mediaUrl) => ({ mediaUrl })));
   }
 
   return out;
-}
-
-async function buildActivity(
-  msg: MSTeamsRenderedMessage,
-  conversationRef: StoredConversationReference,
-  tokenProvider?: MSTeamsAccessTokenProvider,
-  sharePointSiteId?: string,
-  mediaMaxBytes?: number,
-  options?: { feedbackLoopEnabled?: boolean } & MSTeamsSendHandoff,
-): Promise<Record<string, unknown>> {
-  const activity: Record<string, unknown> = buildMSTeamsMessageActivity(msg.text);
-
-  // Mark as AI-generated so Teams renders the "AI generated" badge.
-  activity.channelData = {
-    feedbackLoopEnabled: options?.feedbackLoopEnabled ?? false,
-  };
-
-  if (msg.mediaUrl) {
-    let contentUrl = msg.mediaUrl;
-    let contentType = await getMimeType(msg.mediaUrl);
-    let fileName = await extractFilename(msg.mediaUrl);
-
-    if (isLocalPath(msg.mediaUrl)) {
-      const maxBytes = mediaMaxBytes ?? MSTEAMS_MAX_MEDIA_BYTES;
-      const media = await loadWebMedia(msg.mediaUrl, maxBytes);
-      contentType = media.contentType ?? contentType;
-      fileName = media.fileName ?? fileName;
-
-      // Teams only accepts base64 data URLs for images
-      const conversationType = normalizeOptionalLowercaseString(
-        conversationRef.conversation?.conversationType,
-      );
-      const isPersonal = conversationType === "personal";
-      const isImage = media.kind === "image";
-
-      if (
-        requiresFileConsent({
-          conversationType,
-          contentType,
-          bufferSize: media.buffer.length,
-        })
-      ) {
-        const conversationId = conversationRef.conversation?.id ?? "unknown";
-        assertMSTeamsSendHandoff(options);
-        const { activity: consentActivity, uploadId } = prepareFileConsentActivity({
-          media: { buffer: media.buffer, filename: fileName, contentType },
-          conversationId,
-          description: msg.text || undefined,
-        });
-
-        // Tag the activity so the caller can store the activity ID after sending
-        consentActivity["_pendingUploadId"] = uploadId;
-
-        return consentActivity;
-      }
-
-      if (!isPersonal && !isImage) {
-        // Non-images in group chats/channels require SharePoint because an
-        // application token has no signed-in `/me/drive` to fall back to.
-        const siteId = requireMSTeamsSharePointSiteId(sharePointSiteId);
-        if (!tokenProvider) {
-          throw new Error("MS Teams Graph token provider unavailable for SharePoint file send");
-        }
-        const chatId = conversationRef.conversation?.id;
-
-        const uploaded = await uploadAndShareSharePoint({
-          assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
-          buffer: media.buffer,
-          filename: fileName,
-          contentType,
-          tokenProvider,
-          siteId,
-          chatId: chatId ?? undefined,
-          usePerUserSharing: conversationType === "groupchat",
-        });
-
-        const driveItem = await getDriveItemProperties({
-          assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
-          siteId,
-          itemId: uploaded.itemId,
-          tokenProvider,
-        });
-
-        activity.attachments = [buildTeamsFileInfoCard(driveItem)];
-
-        return activity;
-      }
-
-      // Image (any chat): use base64 (works for images in all conversation types)
-      const base64 = media.buffer.toString("base64");
-      contentUrl = `data:${media.contentType};base64,${base64}`;
-    }
-
-    activity.attachments = [
-      {
-        name: fileName,
-        contentType,
-        contentUrl,
-      },
-    ];
-  }
-
-  return activity;
 }
 
 export async function sendMSTeamsMessages(
@@ -270,7 +173,7 @@ export async function sendMSTeamsMessages(
   } & MSTeamsSendHandoff,
 ): Promise<string[]> {
   const messages = params.messages.filter(
-    (m) => (m.text && m.text.trim().length > 0) || m.mediaUrl,
+    (m) => (m.text && m.text.trim().length > 0) || m.mediaUrl || m.adaptiveCard,
   );
   if (messages.length === 0) {
     return [];
@@ -282,8 +185,111 @@ export async function sendMSTeamsMessages(
     message: MSTeamsRenderedMessage,
     messageIndex: number,
   ): Promise<string> => {
-    let activity: Record<string, unknown> | undefined;
-    let pendingUploadId: string | undefined;
+    async function buildActivity(): Promise<{
+      activity: Record<string, unknown>;
+      pendingUploadId?: string;
+    }> {
+      const msg = message;
+      const { conversationRef, tokenProvider, sharePointSiteId, mediaMaxBytes } = params;
+      const options = {
+        feedbackLoopEnabled: params.feedbackLoopEnabled,
+        assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
+      };
+      const activity: Record<string, unknown> = buildMSTeamsMessageActivity(msg.text);
+      if (msg.adaptiveCard) {
+        Object.assign(activity, buildMSTeamsAdaptiveCardActivity(msg.adaptiveCard));
+      }
+
+      // Mark as AI-generated so Teams renders the "AI generated" badge.
+      activity.channelData = {
+        feedbackLoopEnabled: options?.feedbackLoopEnabled ?? false,
+      };
+
+      if (msg.mediaUrl) {
+        let contentUrl = msg.mediaUrl;
+        let contentType = await getMimeType(msg.mediaUrl);
+        let fileName = await extractFilename(msg.mediaUrl);
+
+        if (isLocalPath(msg.mediaUrl)) {
+          const maxBytes = mediaMaxBytes ?? MSTEAMS_MAX_MEDIA_BYTES;
+          const media = await loadWebMedia(msg.mediaUrl, maxBytes);
+          contentType = media.contentType ?? contentType;
+          fileName = media.fileName ?? fileName;
+
+          // Teams only accepts base64 data URLs for images
+          const conversationType = normalizeOptionalLowercaseString(
+            conversationRef.conversation?.conversationType,
+          );
+          const isPersonal = conversationType === "personal";
+          const isImage = media.kind === "image";
+
+          if (
+            requiresFileConsent({
+              conversationType,
+              contentType,
+              bufferSize: media.buffer.length,
+            })
+          ) {
+            const conversationId = conversationRef.conversation?.id ?? "unknown";
+            assertMSTeamsSendHandoff(options);
+            const { activity: consentActivity, uploadId } = prepareFileConsentActivity({
+              media: { buffer: media.buffer, filename: fileName, contentType },
+              conversationId,
+              description: msg.text || undefined,
+            });
+
+            return { activity: consentActivity, pendingUploadId: uploadId };
+          }
+
+          if (!isPersonal && !isImage) {
+            // Non-images in group chats/channels require SharePoint because an
+            // application token has no signed-in `/me/drive` to fall back to.
+            const siteId = requireMSTeamsSharePointSiteId(sharePointSiteId);
+            if (!tokenProvider) {
+              throw new Error("MS Teams Graph token provider unavailable for SharePoint file send");
+            }
+            const chatId = conversationRef.conversation?.id;
+
+            const uploaded = await uploadAndShareSharePoint({
+              assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
+              buffer: media.buffer,
+              filename: fileName,
+              contentType,
+              tokenProvider,
+              siteId,
+              chatId,
+              usePerUserSharing: conversationType === "groupchat",
+            });
+
+            const driveItem = await getDriveItemProperties({
+              assertDirectAdapterHandoff: options?.assertDirectAdapterHandoff,
+              siteId,
+              itemId: uploaded.itemId,
+              tokenProvider,
+            });
+
+            activity.attachments = [buildTeamsFileInfoCard(driveItem)];
+
+            return { activity };
+          }
+
+          // Image (any chat): use base64 (works for images in all conversation types)
+          const base64 = media.buffer.toString("base64");
+          contentUrl = `data:${media.contentType};base64,${base64}`;
+        }
+
+        activity.attachments = [
+          {
+            name: fileName,
+            contentType,
+            contentUrl,
+          },
+        ];
+      }
+
+      return { activity };
+    }
+    let prepared: Awaited<ReturnType<typeof buildActivity>> | undefined;
     let response: unknown;
     try {
       response = await retryAsync(
@@ -291,27 +297,11 @@ export async function sendMSTeamsMessages(
           assertMSTeamsSendHandoff(params);
           // Retry failed preparation, but keep its successful I/O and SharePoint work
           // out of subsequent provider retries.
-          activity ??= await buildActivity(
-            message,
-            params.conversationRef,
-            params.tokenProvider,
-            params.sharePointSiteId,
-            params.mediaMaxBytes,
-            {
-              feedbackLoopEnabled: params.feedbackLoopEnabled,
-              assertDirectAdapterHandoff: params.assertDirectAdapterHandoff,
-            },
-          );
-
-          pendingUploadId ??=
-            typeof activity["_pendingUploadId"] === "string"
-              ? activity["_pendingUploadId"]
-              : undefined;
-          delete activity["_pendingUploadId"];
+          prepared ??= await buildActivity();
 
           assertMSTeamsSendHandoff(params);
           providerDispatchStarted = true;
-          return await sendFn(activity);
+          return await sendFn(prepared.activity);
         },
         {
           attempts: MSTEAMS_SEND_ATTEMPTS,
@@ -353,6 +343,7 @@ export async function sendMSTeamsMessages(
     await params.onMessageSent?.(messageId, messageIndex);
 
     // Store the activity ID so the accept handler can replace the consent card in-place
+    const pendingUploadId = prepared?.pendingUploadId;
     if (pendingUploadId && messageId !== "unknown") {
       setPendingUploadActivityId(pendingUploadId, messageId);
     }

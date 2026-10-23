@@ -12,7 +12,7 @@ import {
   matchesCodexSnapshotTurn,
   shouldClearTerminalPresentationForNativeItem,
 } from "./event-projector-items.js";
-import { CodexTurnProjection } from "./event-projector-result.js";
+import { CodexTurnProjection, type CodexAppServerToolTelemetry } from "./event-projector-result.js";
 import { buildCodexSteeringMessagesSnapshot } from "./event-projector-snapshot.js";
 import type { CodexToolProgressProjection } from "./event-projector-tool-progress.js";
 import {
@@ -62,18 +62,25 @@ export class CodexAppServerEventProjector extends CodexTurnProjection {
   }
 
   /** Native completion owns the answer independently of unfinished host projection. */
-  recoverCompletedAnswer(): boolean {
+  recoverCompletedAnswer(
+    toolTelemetry: CodexAppServerToolTelemetry,
+    options?: { readRetainedNativeCommands?: () => ReadonlyMap<string, string> },
+  ): boolean {
     const completed = this.settlement.completedAnswer;
     if (!completed || this.aborted || this.promptError) {
       return false;
     }
+    this.completedTurn = completed.turn;
+    this.assistantProjection.recordItemCompleted(completed.answer);
+    this.assistantProjection.finalizeAnswerCandidate(completed.turn);
+    // Settlement expiry abandons blocked checkpoint writes. Materialize any
+    // missing native result first so the final transcript mirror retains the
+    // unknown outcome instead of presenting the recovered answer as clean.
+    this.prepareTerminalToolResultCheckpoint(toolTelemetry, options);
     // Retire accepted writes before the enriched final enters the same mirror owner.
     this.closeCompactionProgress();
     this.projectionController.abort();
     this.transcriptCheckpoint.abandon();
-    this.completedTurn = completed.turn;
-    this.assistantProjection.recordItemCompleted(completed.answer);
-    this.assistantProjection.finalizeAnswerCandidate(completed.turn);
     return true;
   }
 
@@ -236,9 +243,16 @@ export class CodexAppServerEventProjector extends CodexTurnProjection {
       case "turn/completed":
         await this.handleTurnCompleted(notification.completedTurn);
         break;
-      case "rawResponse/completed":
-        this.usageProjection.record(params, this.params.hostCapabilities.reportOutputTokens);
+      case "rawResponse/completed": {
+        const response = this.usageProjection.record(
+          params,
+          this.params.hostCapabilities.reportOutputTokens,
+        );
+        if (response) {
+          this.options.onResponseObserved?.(response);
+        }
         break;
+      }
       case "rawResponseItem/completed":
         await this.handleRawResponseItemCompleted(params);
         break;
@@ -655,11 +669,19 @@ export class CodexAppServerEventProjector extends CodexTurnProjection {
       item?.type === "agentMessage"
         ? this.assistantProjection.assistantTextByItem.get(item.id)
         : undefined;
-    if (streamed && typeof item?.text === "string" && item.text.startsWith(streamed)) {
-      await this.assistantProjection.handleAssistantDelta({
-        itemId: item.id,
-        delta: item.text.slice(streamed.length),
-      });
+    if (
+      streamed &&
+      typeof item?.text === "string" &&
+      item.text.startsWith(streamed) &&
+      (notification || item.text !== streamed)
+    ) {
+      await this.assistantProjection.handleAssistantDelta(
+        {
+          itemId: item.id,
+          delta: item.text.slice(streamed.length),
+        },
+        true,
+      );
     }
     const asyncMessage = this.assistantProjection.recordItemCompleted(
       item,

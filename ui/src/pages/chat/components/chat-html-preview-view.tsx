@@ -1,13 +1,13 @@
-import type { LazyCustomElementRequestController } from "../../../app/lazy-custom-element.ts";
+import { lazy } from "solid-js";
 import { LazyViewError } from "../../../components/solid/lazy-view-error.tsx";
+import { PanelLoadingSkeleton } from "../../../components/solid/panel-loading-skeleton.tsx";
 import type { EmbedSandboxMode } from "../../../lib/chat/tool-display.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
-import { solidContent, type LegacyDirectiveResult } from "../../../lit/solid-content.tsx";
+import { ChatImportBoundary } from "./chat-import-boundary.tsx";
 import type { SessionFileSource } from "./chat-sidebar-content-types.ts";
 
-type PreviewProps = {
-  state: LazyCustomElementRequestController["visibleState"];
-  onRetry: () => void;
+export type PreviewProps = {
+  desktop?: boolean;
   content: string;
   sourceIdentity: string;
   title: string;
@@ -15,49 +15,44 @@ type PreviewProps = {
   sessionFileSource?: SessionFileSource;
 };
 
-function HtmlPreview(props: PreviewProps) {
+const Preview = lazy(() => import("./chat-html-preview-element.tsx"), {
+  export: "ChatHtmlPreview",
+});
+
+export function HtmlPreviewLoading() {
+  return <PanelLoadingSkeleton variant="document" label={t("common.loading")} compact />;
+}
+
+export function HtmlPreview(props: PreviewProps) {
   return (
-    <>
-      {props.state?.status === "error" ? (
-        <LazyViewError
-          error={props.state.error}
-          stale={props.state.stale}
-          onRetry={props.onRetry}
-        />
-      ) : props.state ? (
-        <div role="status">{t("common.loading")}</div>
-      ) : undefined}
-      <openclaw-chat-html-preview
-        prop:html={props.content}
-        prop:sourceIdentity={props.sourceIdentity}
-        prop:title={props.title}
-        prop:embedSandboxMode={props.embedSandboxMode}
-        prop:sessionFileSource={props.sessionFileSource}
+    <ChatImportBoundary
+      identity={[props.sourceIdentity, props.content]}
+      fallback={() => <HtmlPreviewLoading />}
+    >
+      <Preview
+        desktop={props.desktop ?? false}
+        html={props.content}
+        sourceIdentity={props.sourceIdentity}
+        title={props.title}
+        embedSandboxMode={props.embedSandboxMode}
+        sessionFileSource={props.sessionFileSource}
       />
-    </>
+    </ChatImportBoundary>
   );
 }
 
-type SourceFallbackProps = {
+export type SourceFallbackProps = {
   error: Error;
   stale: boolean;
   onRetry: () => void;
   text: string;
 };
 
-function HtmlPreviewSourceFallback(props: SourceFallbackProps) {
+export function HtmlPreviewSourceFallback(props: SourceFallbackProps) {
   return (
     <>
       <LazyViewError error={props.error} stale={props.stale} onRetry={props.onRetry} />
       <pre class="sidebar-attachment-preview__text">{props.text}</pre>
     </>
   );
-}
-
-export function renderHtmlPreview(props: PreviewProps): LegacyDirectiveResult {
-  return solidContent(HtmlPreview, props);
-}
-
-export function renderHtmlPreviewSourceFallback(props: SourceFallbackProps): LegacyDirectiveResult {
-  return solidContent(HtmlPreviewSourceFallback, props);
 }

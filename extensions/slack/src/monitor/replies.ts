@@ -5,15 +5,15 @@ import {
   createChannelPartialDeliveryError,
   getGroupThreadDeliverySession,
 } from "openclaw/plugin-sdk/channel-inbound";
-import type { MarkdownTableMode, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type {
+  ReplyToMode,
+  MarkdownTableMode,
+  OpenClawConfig,
+} from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
-import {
-  chunkMarkdownTextWithMode,
-  isSilentReplyText,
-  SILENT_REPLY_TOKEN,
-  type ChunkMode,
-} from "openclaw/plugin-sdk/reply-chunking";
+import { questionGatewayRuntime } from "openclaw/plugin-sdk/question-gateway-runtime";
+import { chunkMarkdownTextWithMode, type ChunkMode } from "openclaw/plugin-sdk/reply-chunking";
 import {
   deliverTextOrMediaReply,
   getReplyPayloadTtsSupplement,
@@ -37,6 +37,7 @@ import {
   chunkSlackTextAtHardLimit,
   type SlackFormattingDisabledMessage,
 } from "../native-data-fallback.js";
+import { registerSlackQuestionDelivery } from "../question-delivery.js";
 import {
   hasSlackReplyStructuredContent,
   iterateSlackReplyDeliveryMessages,
@@ -44,7 +45,12 @@ import {
   resolveSlackReplyBlocks,
   type PreparedSlackReply,
 } from "../reply-blocks.js";
-import { sendMessageSlack, type SlackSendIdentity, type SlackSendResult } from "../send.js";
+import {
+  sendMessageSlack,
+  updateMessageSlack,
+  type SlackSendIdentity,
+  type SlackSendResult,
+} from "../send.js";
 import { resolveSlackReplyThreadTs } from "../thread-ts.js";
 import type { SlackEventScope } from "./event-scope.js";
 import {
@@ -126,7 +132,7 @@ export async function deliverReplies(params: {
   textLimit: number;
   mediaMaxBytes?: number;
   replyThreadTs?: string;
-  replyToMode: "off" | "first" | "all" | "batched";
+  replyToMode: ReplyToMode;
   identity?: SlackSendIdentity;
   metadata?: MessageMetadata;
   /** Logical conversation target used by lifecycle hooks when delivery uses a physical Slack id. */
@@ -168,11 +174,9 @@ export async function deliverReplies(params: {
       replyToCurrent: payload.replyToCurrent,
     });
     const reply = resolveSendableOutboundReplyParts(payload);
-    const textRaw =
-      reply.hasText && !isSilentReplyText(reply.trimmedText, SILENT_REPLY_TOKEN)
-        ? reply.trimmedText
-        : undefined;
+    const textRaw = reply.hasText ? reply.trimmedText : undefined;
     const { authoredTextPlacement, segments } = prepared.resolveDelivery();
+    const questionId = questionGatewayRuntime.readAskUserQuestionId(payload);
     if (!textRaw && !reply.hasMedia && segments.length === 0) {
       continue;
     }
@@ -197,6 +201,23 @@ export async function deliverReplies(params: {
         ...(mediaLocalRoots ? { mediaLocalRoots } : {}),
         onDeliveryResult: (result) => {
           acceptedResults.push(result);
+          if (questionId) {
+            registerSlackQuestionDelivery({
+              questionId,
+              accountId: params.accountId,
+              result,
+              text,
+              update: async (message) => {
+                await updateMessageSlack({
+                  ...message,
+                  cfg: params.cfg,
+                  accountId: params.accountId,
+                  token: params.token,
+                  eventScope: params.eventScope,
+                });
+              },
+            });
+          }
         },
         ...(params.eventScope
           ? {
@@ -318,7 +339,7 @@ type SlackRespondFn = (payload: {
 type SlackResponseUrlBudget = ResponseUrlBudget<Parameters<SlackRespondFn>[0]>;
 
 export function createSlackReplyDeliveryPlan(params: {
-  replyToMode: "off" | "first" | "all" | "batched";
+  replyToMode: ReplyToMode;
   incomingThreadTs: string | undefined;
   messageTs: string | undefined;
   hasRepliedRef: { value: boolean };
@@ -405,10 +426,7 @@ export async function deliverSlackSlashReplies(params: {
       continue;
     }
     const reply = resolveSendableOutboundReplyParts(payload);
-    const textRaw =
-      reply.hasText && !isSilentReplyText(reply.trimmedText, SILENT_REPLY_TOKEN)
-        ? reply.trimmedText
-        : undefined;
+    const textRaw = reply.hasText ? reply.trimmedText : undefined;
     const materializeAuthoredText = hasSlackReplyStructuredContent(payload);
     const { authoredTextPlacement, segments } = resolveSlackReplyBlockResolution(payload, {
       materializeAuthoredText,

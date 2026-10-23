@@ -1,5 +1,6 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { Transferable } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import { bindSqliteWorkerDatabase } from "../../infra/sqlite-worker-binding.js";
 import type {
   SqliteWorkerBackend,
@@ -48,9 +49,13 @@ import { readSessionSourceValidation } from "./session-source-predicate.worker.j
 import { readStagedSessionTranscriptAuthority } from "./session-transcript-authority.js";
 
 export type SessionWorkerDatabaseBinding = {
-  database: DatabaseSync;
+  database: EngineConnection;
   databasePath: string;
-  admit(stage: "transaction" | "commit", restriction?: AgentDatabaseAdmissionRestriction): void;
+  admit(
+    stage: "prepare" | "transaction" | "commit",
+    restriction?: AgentDatabaseAdmissionRestriction,
+    transferList?: Transferable[],
+  ): void;
 };
 
 /** Private write domains borrow one canonical connection and its admission lifecycle. */
@@ -83,22 +88,24 @@ export function bindSessionWorkerBackend<Operations extends SqliteWorkerOperatio
 function createSessionWorkerOperationContext(
   database: OpenClawAgentDatabase,
   options: AgentWorkerOperationContext["options"],
-  bound: {
-    admit(stage: "transaction" | "commit", restriction?: AgentDatabaseAdmissionRestriction): void;
-  },
+  bound: Pick<SessionWorkerDatabaseBinding, "admit">,
   domain: string,
 ): AgentWorkerOperationContext {
   const native = database.db;
   const context: AgentWorkerOperationContext = {
     options,
     open: () => database,
-    admit(stage, publication) {
-      bound.admit(stage, (request, dispatch) => {
-        if (!isRecord(request.facts)) {
-          throw new Error(`${domain} admission omitted its database identity`);
-        }
-        dispatch({ ...request, facts: { ...request.facts, publication } });
-      });
+    admit(stage, publication, transferList) {
+      bound.admit(
+        stage,
+        (request, dispatch) => {
+          if (!isRecord(request.facts)) {
+            throw new Error(`${domain} admission omitted its database identity`);
+          }
+          dispatch({ ...request, facts: { ...request.facts, publication } });
+        },
+        transferList,
+      );
     },
     writeTransaction(operationLabel, owner, write, diagnosticContext) {
       return runOpenClawAgentWriteTransaction(
@@ -196,6 +203,7 @@ export function commitSessionEntryPatch(
         },
       };
       let mutation;
+      let lifecycleEffects: SessionEntryPatchCommitted["lifecycleEffects"];
       if ("operation" in input) {
         if (input.validateCanonicalKeys) {
           assertCanonicalSqliteSessionKeysCurrent(database);
@@ -240,6 +248,9 @@ export function commitSessionEntryPatch(
           existing,
           writeBase,
           operation: input.operation,
+          onLifecycleProjection: (effects) => {
+            lifecycleEffects = effects;
+          },
         });
         mutation = writeSessionEntryPatchInDatabase(database, {
           sessionKey: input.sessionKey,
@@ -276,8 +287,9 @@ export function commitSessionEntryPatch(
       }
       result = {
         kind: "session-entry-patch",
-        entry: mutation.entry,
+        ...(input.returnEntry === false ? {} : { entry: mutation.entry }),
         applied: mutation.applied,
+        lifecycleEffects,
         publication,
         transcriptPredicate:
           mutation.entry.sessionId === predicate.transcriptPredicate?.sessionId

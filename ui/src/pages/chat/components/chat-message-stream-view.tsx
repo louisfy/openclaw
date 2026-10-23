@@ -1,33 +1,36 @@
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { createMemo, For, Show } from "solid-js";
 import type { ThemeBranding } from "../../../../../packages/gateway-protocol/src/theme.ts";
+import { unwrapToolCallForDisplay } from "../../../../../src/agents/tool-display-call.js";
 import type { QuestionPrompt } from "../../../app/question-prompt.ts";
 import { Icon } from "../../../components/solid/icon.tsx";
 import type { ChatReplyTarget, MessageGroup, ChatItem } from "../../../lib/chat/chat-types.ts";
 import { describeToolGroup, readPreparedActivity } from "../../../lib/chat/tool-call-grouping.ts";
 import { extractToolCardsCached, resolveToolCardOutcome } from "../../../lib/chat/tool-cards.ts";
-import { resolveToolDisplay } from "../../../lib/chat/tool-display.ts";
+import { resolveToolDisplayIdentity } from "../../../lib/chat/tool-display-identity.ts";
 import { formatDurationLong } from "../../../lib/format-duration.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import "../../../components/tooltip.ts";
-import { emptyLegacyContent as litNothing, LitContent } from "../../../lit/solid-content.tsx";
 import { ChatAvatar, type ChatAvatarProps } from "../chat-avatar-view.tsx";
 import type { ChatSubagentWait } from "../chat-subagent-wait.ts";
-import type { GroupedMessageOptions } from "./chat-message-bubble-options.ts";
+import type { MessageRenderOptions } from "./chat-message-bubble-options.ts";
 import { GroupedMessage } from "./chat-message-bubble-view.tsx";
 import {
   prepareChatMessageRender,
   resolveMessageActionDetails,
 } from "./chat-message-markdown-view.tsx";
 import { ChatTimestamp } from "./chat-message-timestamp-view.tsx";
-import { renderChatQuestionSummary } from "./chat-question-card.ts";
+import { ChatQuestionSummary } from "./chat-question-summary.tsx";
 import { resolveGroupReplyLine } from "./chat-reply-attribution.ts";
 import { ReplyLineView, ReplyLineConnector } from "./chat-reply-attribution.tsx";
+import type { ReplyConnectorElements } from "./chat-reply-connector.ts";
 import type { ReplyPreviewLookup } from "./chat-reply-preview.types.ts";
 import type { SidebarContent } from "./chat-sidebar-content-types.ts";
-import { BrowserTabPreviews, syncToolDisclosureOverflow } from "./chat-tool-cards.solid.tsx";
+import type { SubagentActivityProps } from "./chat-subagent-activity.ts";
+import { syncToolDisclosureOverflow } from "./chat-tool-card-chrome.tsx";
+import { BrowserTabPreviews } from "./chat-tool-cards.solid.tsx";
 import type { BrowserTabPreview } from "./chat-tool-cards.ts";
-import { ChatToolOutcomeSummary } from "./chat-tool-outcome-summary.solid.tsx";
+import { ToolOutcomeSummary } from "./chat-tool-outcome-summary.solid.tsx";
 import { summarizeToolCardOutcomes } from "./chat-tool-render-model.ts";
 import { ChatWorkingIndicator } from "./chat-working-indicator.tsx";
 
@@ -37,44 +40,11 @@ export type StreamGroupPart = Extract<
   { kind: "stream" } | { kind: "reading-indicator" } | { kind: "question" }
 >;
 
-type StreamMessageOptions = Pick<
-  GroupedMessageOptions,
-  | "onOpenReply"
-  | "replyNavigationId"
-  | "sessionKey"
-  | "presented"
-  | "boardProvider"
-  | "widgetLayout"
-  | "agentId"
-  | "runActive"
-  | "asyncQuestions"
-  | "onRequestUpdate"
-  | "canvasPluginSurfaceUrl"
-  | "resourceBasePath"
-  | "mediaPolicyKey"
-  | "connectionEpoch"
-  | "assistantAttachmentAuthToken"
-  | "resolveArtifactDownload"
-  | "getTurnVideoMessages"
-  | "onRequestOpenImage"
-  | "onOpenImage"
-  | "onAssistantAttachmentLoaded"
-  | "embedSandboxMode"
-  | "allowExternalEmbedUrls"
-  | "fetchLinkFavicon"
-  | "pluginToolIcons"
-  | "githubRepo"
-  | "githubRepositories"
-  | "onOpenWorkspaceFile"
-  | "onPermissionRetry"
->;
-
-export type StreamGroupOptions = StreamMessageOptions & {
+export type StreamGroupOptions = MessageRenderOptions & {
   resolveReplyPreview?: ReplyPreviewLookup;
   branding?: ThemeBranding;
   bubbleMode?: boolean;
   firstBubbleKey?: string | null;
-  entryRefFor?: (key: string) => ((element?: Element) => void) | undefined;
   onReply?: (target: ChatReplyTarget) => void;
   onOpenSidebar?: (content: SidebarContent) => void;
   assistant?: ChatAvatarProps["assistant"];
@@ -84,7 +54,7 @@ export type StreamGroupOptions = StreamMessageOptions & {
   waitingApproval?: boolean;
   waitingSubagents?: ChatSubagentWait;
   runningSubagents?: number;
-  subagentActivity?: unknown;
+  subagentActivity?: SubagentActivityProps;
   onOpenSubagents?: () => void;
   runOutputTokens?: number | null;
   questionPrompts?: ReadonlyMap<string, QuestionPrompt>;
@@ -151,15 +121,17 @@ function NonstreamPart(props: {
   presentation: "standalone" | "continuation";
 }) {
   const indicator = () => (props.part.kind === "reading-indicator" ? props.part : undefined);
-  const question = createMemo(() => {
-    const prompt =
-      props.part.kind === "question"
-        ? props.options.questionPrompts?.get(props.part.questionId)
-        : undefined;
-    return prompt ? renderChatQuestionSummary(prompt) : litNothing;
-  });
+  const question = () =>
+    props.part.kind === "question"
+      ? props.options.questionPrompts?.get(props.part.questionId)
+      : undefined;
   return (
-    <Show when={indicator()} fallback={<LitContent value={question()} />}>
+    <Show
+      when={indicator()}
+      fallback={
+        <Show when={question()}>{(prompt) => <ChatQuestionSummary prompt={prompt()} />}</Show>
+      }
+    >
       {(part) => (
         <ChatWorkingIndicator
           part={part()}
@@ -214,7 +186,6 @@ function StreamingMessage(props: {
       options={{
         ...props.options,
         isStreaming: part().isStreaming,
-        entryRef: props.options.entryRefFor?.(part().key),
         showReasoning: Boolean(part().thinking),
         messageActions: actions(),
       }}
@@ -227,6 +198,7 @@ function StreamingMessage(props: {
 // arrives as several stream segments renders under a single avatar/footer
 // instead of flashing a separate avatar+bubble per segment (#63956).
 export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGroupOptions }) {
+  const replyElements: ReplyConnectorElements = {};
   const starts = () =>
     props.parts.flatMap((part) => (part.kind === "stream" ? [part.startedAt] : []));
   const startedAt = () => (starts().length ? Math.min(...starts()) : null);
@@ -249,6 +221,7 @@ export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGr
   const hasReply = () => replyLine().state !== "hidden" && hasAvatar();
   return (
     <div
+      ref={(element) => (replyElements.group = element)}
       class={[
         "chat-group assistant",
         {
@@ -258,15 +231,22 @@ export function StreamGroup(props: { parts: StreamGroupPart[]; options: StreamGr
         },
       ]}
       data-chat-row-key={props.parts[0]?.key}
+      data-chat-streaming={active() ? "true" : undefined}
     >
       <Show when={hasAvatar()}>
-        <ChatAvatar role="assistant" assistant={props.options.assistant} />
+        <ChatAvatar
+          role="assistant"
+          assistant={props.options.assistant}
+          elementRef={(element) => (replyElements.avatar = element)}
+        />
       </Show>
-      <div class="chat-group-messages">
-        <ReplyLineView line={replyLine()} actions={props.options} />
+      <div ref={(element) => (replyElements.messages = element)} class="chat-group-messages">
+        <ReplyLineView line={replyLine()} actions={props.options} elements={replyElements} />
         <StreamGroupParts parts={props.parts} options={props.options} presentation="standalone" />
       </div>
-      <ReplyLineConnector line={replyLine()} avatar={hasAvatar() ? true : litNothing} />
+      <Show when={hasAvatar()}>
+        <ReplyLineConnector line={replyLine()} avatar={true} elements={replyElements} />
+      </Show>
       <Show when={startedAt() !== null}>
         <div class="chat-group-footer" aria-hidden={active() ? "true" : undefined}>
           <Show when={!active()}>
@@ -332,7 +312,7 @@ function prepareWorkGroupSummary(item: WorkGroupSummaryItem) {
   const activity = prepared.flatMap((entry) => entry.activity);
   for (const [index, card] of fallback.entries()) {
     const outcome = resolveToolCardOutcome(card, false);
-    const display = resolveToolDisplay(card);
+    const display = resolveToolDisplayIdentity(unwrapToolCallForDisplay(card).name);
     activity.push({
       itemId: `work-summary-raw:${index}`,
       toolCallId: card.callId,
@@ -355,6 +335,8 @@ function WorkGroupSummaryBody(props: {
   summary: ReturnType<typeof prepareWorkGroupSummary>;
   options: WorkGroupSummaryOptions;
 }) {
+  let disclosureContent: HTMLSpanElement | undefined;
+  const syncOverflow = (event: Event) => syncToolDisclosureOverflow(event, disclosureContent);
   const compact = () => props.options.bubbleMode;
   return (
     <div
@@ -370,11 +352,14 @@ function WorkGroupSummaryBody(props: {
         class="chat-inline-disclosure chat-activity-group__summary"
         type="button"
         aria-expanded={props.options.expanded ? "true" : "false"}
-        onPointerEnter={syncToolDisclosureOverflow}
-        onFocus={syncToolDisclosureOverflow}
+        onPointerEnter={syncOverflow}
+        onFocus={syncOverflow}
         onClick={() => props.options.onToggle()}
       >
-        <span class="chat-tool-disclosure__content">
+        <span
+          ref={(element) => (disclosureContent = element)}
+          class="chat-tool-disclosure__content"
+        >
           <span class="chat-activity-group__label">{props.summary.label}</span>
         </span>
         <Show when={props.options.expanded && props.summary.total > 0}>
@@ -398,11 +383,9 @@ function WorkGroupSummaryBody(props: {
         >
           <span class="chat-work-group__outcomes">
             {" · "}
-            <ChatToolOutcomeSummary
-              cards={props.summary.cards}
-              activity={props.summary.activity}
-              style={{ display: "contents" }}
-            />
+            <openclaw-chat-tool-outcome-summary style={{ display: "contents" }}>
+              <ToolOutcomeSummary cards={props.summary.cards} activity={props.summary.activity} />
+            </openclaw-chat-tool-outcome-summary>
           </span>
         </Show>
         <span class="chat-tool-row__chevron" aria-hidden="true">

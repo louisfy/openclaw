@@ -3,7 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   openEngineWorkerStore,
-  resolveDatabaseEngineInput,
+  getDatabaseEngineInput,
   runEngineStoreOperation,
   type DatabaseEngineInput,
 } from "openclaw/plugin-sdk/database-engine-runtime";
@@ -27,16 +27,12 @@ export class LogbookStore {
   readonly framesDir: string;
   private closing: Promise<void> | undefined;
 
-  static async open(
-    dataDir: string,
-    workerModuleUrl: URL,
-    config: Parameters<typeof resolveDatabaseEngineInput>[0] = {},
-  ): Promise<LogbookStore> {
+  static async open(dataDir: string, workerModuleUrl: URL): Promise<LogbookStore> {
     if (!dataDir) {
       throw new Error("Logbook data directory is required");
     }
     const root = await canonicalPathFromExistingAncestor(path.resolve(dataDir));
-    const postgresInput = await resolveDatabaseEngineInput(config);
+    const postgresInput = getDatabaseEngineInput("logbook");
     const worker = await openEngineWorkerStore<LogbookOperations>(
       {
         moduleUrl: workerModuleUrl,
@@ -93,24 +89,12 @@ export class LogbookStore {
     return path.join(this.framesDir, day, `${capturedAtMs}.jpg`);
   }
 
-  insertFrame(params: LogbookFrameInput) {
-    return this.execute("insertFrame", params);
-  }
-
-  lastFrame() {
-    return this.execute("lastFrame", undefined);
-  }
-
   unbatchedActiveFrames(limit: number) {
     return this.execute("unbatchedActiveFrames", { limit });
   }
 
   countUnbatchedActiveFrames() {
     return this.execute("countUnbatchedActiveFrames", undefined);
-  }
-
-  frameById(id: number) {
-    return this.execute("frameById", { id });
   }
 
   framesInRange(startMs: number, endMs: number) {
@@ -157,19 +141,12 @@ export class LogbookStore {
     return this.execute("countCardsForDay", { day });
   }
 
-  replaceCardsInWindow(
-    day: string,
-    startMs: number,
-    endMs: number,
-    drafts: LogbookCardDraft[],
-    options?: { selectKeyframes: boolean },
-  ) {
+  replaceCardsInWindow(day: string, startMs: number, endMs: number, drafts: LogbookCardDraft[]) {
     return this.execute("replaceCardsInWindow", {
       day,
       startMs,
       endMs,
       drafts,
-      selectKeyframes: options?.selectKeyframes,
     });
   }
 
