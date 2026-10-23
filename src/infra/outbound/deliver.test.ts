@@ -37,6 +37,7 @@ import {
   registerOutboundImageProjectionTests,
   registerOutboundPreparationMetadataTests,
 } from "./deliver.projection.test-support.js";
+import { registerOutboundQueueAckTests } from "./deliver.queue-ack.test-support.js";
 import { createOutboundPayloadPlan, projectOutboundPayloadPlanForOutbound } from "./payloads.js";
 import { createUnmodifiedPreparedOutboundBatch } from "./prepared-batch.js";
 
@@ -223,21 +224,22 @@ vi.mock("./delivery-queue-platform-lease.js", () => ({
 vi.mock("./delivery-queue-recovery.js", () => ({
   withActiveDeliveryClaim: queueMocks.withActiveDeliveryClaim,
 }));
-vi.mock("./delivery-completion.js", () => ({
+vi.mock("./delivery-completion.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./delivery-completion.js")>()),
   completeDurableDelivery: completionMocks.completeDurableDelivery,
   markDurableDeliveryQueued: completionMocks.markDurableDeliveryQueued,
-  rejectDurableDelivery: completionMocks.rejectDurableDelivery,
-  suppressDurableDelivery: completionMocks.suppressDurableDelivery,
   settleDurableDelivery: (
     completion: unknown,
-    evidence: { result: unknown } | { platformSendStarted: boolean },
+    evidence: { result: unknown } | { rejectionError: string } | { platformSendStarted: boolean },
     stateDir?: string,
   ) =>
     "result" in evidence
       ? completionMocks.completeDurableDelivery(completion, evidence.result, stateDir)
-      : evidence.platformSendStarted
-        ? completionMocks.failDurableDelivery(completion, stateDir)
-        : completionMocks.suppressDurableDelivery(completion, stateDir),
+      : "rejectionError" in evidence
+        ? completionMocks.rejectDurableDelivery(completion, evidence.rejectionError, stateDir)
+        : evidence.platformSendStarted
+          ? completionMocks.failDurableDelivery(completion, stateDir)
+          : completionMocks.suppressDurableDelivery(completion, stateDir),
 }));
 vi.mock("../../logging/subsystem.js", () => ({
   createSubsystemLogger: () => {
@@ -1061,75 +1063,68 @@ describe("deliverOutboundPayloads", () => {
     expect(messageSendText).not.toHaveBeenCalled();
   });
 
-  it.each(["message"] as const)(
-    "preserves a whole media list for declared %s payload transport",
-    async (adapter) => {
-      const mediaUrls = ["https://example.com/first.png", "https://example.com/second.png"];
-      const receipt = createMessageReceiptFromOutboundResults({
-        results: [{ messageId: "media-1" }, { messageId: "media-2" }],
-        kind: "media",
-      });
-      const sendPayload = vi.fn(
-        async (_ctx: Pick<Parameters<OutboundPayloadSender>[0], "payload">) => ({
-          channel: "matrix" as const,
-          messageId: "media-2",
-          receipt,
-        }),
-      );
-      const sendMedia = vi.fn<OutboundMediaSender>(async () => ({
-        channel: "matrix",
-        messageId: "single",
-      }));
-      const capabilities = { text: true, media: true, payload: true };
-      const outbound = {
-        sendPayload,
-        sendMedia,
-        sendPayloadGroupsMedia: true,
-        deliveryCapabilities: { durableFinal: capabilities },
-      };
-      if (adapter === "message") {
-        setMatrixMessageAdapter(
-          {
-            id: "matrix",
-            durableFinal: { capabilities },
-            send: {
-              text: vi.fn(),
-              payload: async (ctx) => ({ ...(await sendPayload(ctx)), receipt }),
-            },
-          },
-          outbound,
-        );
-      } else {
-        setTestOutbound(outbound);
-      }
-      const onPayloadDeliveryOutcome = vi.fn();
+  it("preserves a whole media list for declared message payload transport", async () => {
+    const mediaUrls = ["https://example.com/first.png", "https://example.com/second.png"];
+    const receipt = createMessageReceiptFromOutboundResults({
+      results: [{ messageId: "media-1" }, { messageId: "media-2" }],
+      kind: "media",
+    });
+    const sendPayload = vi.fn(
+      async (_ctx: Pick<Parameters<OutboundPayloadSender>[0], "payload">) => ({
+        channel: "matrix" as const,
+        messageId: "media-2",
+        receipt,
+      }),
+    );
+    const sendMedia = vi.fn<OutboundMediaSender>(async () => ({
+      channel: "matrix",
+      messageId: "single",
+    }));
+    const capabilities = { text: true, media: true, payload: true };
+    const outbound = {
+      sendPayload,
+      sendMedia,
+      sendPayloadGroupsMedia: true,
+      deliveryCapabilities: { durableFinal: capabilities },
+    };
+    setMatrixMessageAdapter(
+      {
+        id: "matrix",
+        durableFinal: { capabilities },
+        send: {
+          text: vi.fn(),
+          payload: async (ctx) => ({ ...(await sendPayload(ctx)), receipt }),
+        },
+      },
+      outbound,
+    );
+    const onPayloadDeliveryOutcome = vi.fn();
 
-      const results = await deliverMatrix({
-        payloads: [{ text: "caption", mediaUrls }],
-        onPayloadDeliveryOutcome,
-      });
+    const results = await deliverMatrix({
+      payloads: [{ text: "caption", mediaUrls }],
+      onPayloadDeliveryOutcome,
+    });
 
-      expect(sendPayload).toHaveBeenCalledOnce();
-      expect(sendPayload).toHaveBeenCalledWith(
-        expect.objectContaining({
-          kind: "payload",
-          payload: expect.objectContaining({ text: "caption", mediaUrls }),
-        }),
-      );
-      expect(sendMedia).not.toHaveBeenCalled();
-      expect(results[0]?.receipt?.platformMessageIds).toEqual(["media-1", "media-2"]);
-      expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith(
-        expect.objectContaining({
-          status: "sent",
-          deliveryKind: "media",
-        }),
-      );
+    expect(sendPayload).toHaveBeenCalledOnce();
+    expect(sendPayload).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "payload",
+        payload: expect.objectContaining({ text: "caption", mediaUrls }),
+      }),
+    );
+    expect(sendMedia).not.toHaveBeenCalled();
+    expect(results[0]?.receipt?.platformMessageIds).toEqual(["media-1", "media-2"]);
+    expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: "sent",
+        deliveryKind: "media",
+      }),
+    );
 
-      await deliverMatrix({ payloads: [{ text: "single caption", mediaUrl: mediaUrls[0] }] });
-      expect(sendPayload).toHaveBeenCalledOnce();
-      expect(sendMedia).toHaveBeenCalledOnce();
-    },
-  );
+    await deliverMatrix({ payloads: [{ text: "single caption", mediaUrl: mediaUrls[0] }] });
+    expect(sendPayload).toHaveBeenCalledOnce();
+    expect(sendMedia).toHaveBeenCalledOnce();
+  });
 
   it.each(["cancellation", "owner loss"])(
     "stops a payload-capable channel's media sequence after %s without group opt-in",
@@ -1453,143 +1448,78 @@ describe("deliverOutboundPayloads", () => {
     expect(queueMocks.failDelivery).not.toHaveBeenCalled();
   });
 
-  it("runs sent-result commit hooks when marker fallback ack precedes a partial failure", async () => {
-    queueMocks.markDeliveryPlatformOutcomeUnknown.mockRejectedValueOnce(
-      new Error("unknown marker offline"),
-    );
-    const afterCommit = vi.fn();
-    const messageSendText = vi
-      .fn()
-      .mockResolvedValueOnce(createMatrixMessageSendResult("message-adapter-1"))
-      .mockRejectedValueOnce(new Error("second send failed"));
-    setMatrixMessageAdapter({
-      id: "matrix",
-      durableFinal: { capabilities: { text: true, afterCommit: true } },
-      send: { lifecycle: { afterCommit }, text: messageSendText },
-    });
-
-    const results = await deliverMatrix({
-      payloads: [{ text: "first" }, { text: "second" }],
-      bestEffort: true,
-      queuePolicy: "required",
-    });
-
-    expect(results).toHaveLength(1);
-    expect(queueMocks.ackDelivery).toHaveBeenCalledTimes(1);
-    expect(afterCommit).toHaveBeenCalledTimes(1);
-    expect(queueMocks.failDelivery).not.toHaveBeenCalled();
+  registerOutboundQueueAckTests({
+    createMatrixMessageSendResult,
+    deliverMatrix,
+    hookMocks,
+    queueMocks,
+    setMatrixMessageAdapter,
+    setTestOutbound,
   });
 
-  it("retains unknown-after-send evidence when both the marker and direct ack fail", async () => {
-    queueMocks.markDeliveryPlatformOutcomeUnknown.mockRejectedValueOnce(
-      new Error("unknown marker offline"),
-    );
+  it("clears no-send handoff evidence after a best-effort queue acknowledgement fails", async () => {
     queueMocks.ackDelivery.mockRejectedValueOnce(new Error("ack offline"));
-    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1" });
-
-    await deliverMatrix({
-      payloads: [{ text: "hi" }],
-      deps: { matrix: sendMatrix },
-      queuePolicy: "required",
+    const sendText = installTextOutbound({
+      channel: "matrix",
+      messageId: "",
+      outcome: "not_sent",
     });
+    const onPayloadDeliveryOutcome = vi.fn();
+    const delivery = deliverMatrix({ queuePolicy: "best_effort", onPayloadDeliveryOutcome });
 
-    expect(queueMocks.failDeliveryAfterPlatformSend).toHaveBeenCalledWith(
+    await expect(delivery).resolves.toEqual([]);
+
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(queueMocks.markDeliveryPlatformSendAttemptStarted).toHaveBeenCalledOnce();
+    expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
+      index: 0,
+      status: "suppressed",
+      reason: "adapter_returned_no_send",
+    });
+    expect(queueMocks.failDeliveryBeforePlatformSend).toHaveBeenCalledWith(
       "mock-queue-id",
-      expect.stringContaining("marker=unknown marker offline; ack=ack offline"),
+      expect.stringContaining("failed to ack unsent delivery: ack offline"),
     );
     expect(queueMocks.failDelivery).not.toHaveBeenCalled();
+    expect(queueMocks.failDeliveryAfterPlatformSend).not.toHaveBeenCalled();
   });
 
-  it("fails required delivery when queue ack fails after platform send", async () => {
-    queueMocks.ackDelivery.mockRejectedValueOnce(new Error("ack offline"));
-    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1" });
-
-    await expect(
-      deliverMatrix({
-        payloads: [{ text: "hi" }],
+  it("emits bounded delivery diagnostics for failed sends", async () => {
+    const events: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => events.push(event));
+    const sendMatrix = vi.fn();
+    sendMatrix.mockRejectedValue(new TypeError("secret delivery body could not send"));
+    try {
+      await deliverMatrix({
+        cfg: matrixChunkConfig,
+        payloads: [{ text: "secret delivery body" }],
         deps: { matrix: sendMatrix },
-        queuePolicy: "required",
-      }),
-    ).rejects.toThrow("ack offline");
-
-    expect(sendMatrix).toHaveBeenCalled();
-    expect(queueMocks.markDeliveryPlatformOutcomeUnknown).toHaveBeenCalledWith("mock-queue-id");
-    expect(queueMocks.failDeliveryAfterPlatformSend).toHaveBeenCalledWith(
-      "mock-queue-id",
-      expect.stringContaining("failed to ack sent delivery: ack offline"),
-    );
-    expect(queueMocks.failDelivery).not.toHaveBeenCalled();
-  });
-
-  it.each(["best_effort"] as const)(
-    "clears no-send handoff evidence after a %s queue acknowledgement fails",
-    async (queuePolicy) => {
-      queueMocks.ackDelivery.mockRejectedValueOnce(new Error("ack offline"));
-      const sendText = installTextOutbound({
+        bestEffort: true,
+        session: { key: "session-1" },
+      });
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+    const deliveryEvents = events.filter((event) => event.type.startsWith("message.delivery."));
+    expect(deliveryEvents.map((event) => event.type)).toEqual([
+      "message.delivery.started",
+      "message.delivery.error",
+    ]);
+    for (const event of deliveryEvents) {
+      expect(event).toMatchObject({
         channel: "matrix",
-        messageId: "",
-        outcome: "not_sent",
+        deliveryKind: "text",
+        sessionKey: "session-1",
       });
-      const onPayloadDeliveryOutcome = vi.fn();
-      const delivery = deliverMatrix({ queuePolicy, onPayloadDeliveryOutcome });
-
-      await expect(delivery).resolves.toEqual([]);
-
-      expect(sendText).toHaveBeenCalledOnce();
-      expect(queueMocks.markDeliveryPlatformSendAttemptStarted).toHaveBeenCalledOnce();
-      expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
-        index: 0,
-        status: "suppressed",
-        reason: "adapter_returned_no_send",
-      });
-      expect(queueMocks.failDeliveryBeforePlatformSend).toHaveBeenCalledWith(
-        "mock-queue-id",
-        expect.stringContaining("failed to ack unsent delivery: ack offline"),
-      );
-      expect(queueMocks.failDelivery).not.toHaveBeenCalled();
-      expect(queueMocks.failDeliveryAfterPlatformSend).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["error"] as const)(
-    "emits bounded delivery diagnostics for %s sends",
-    async (outcome) => {
-      const events: DiagnosticEventPayload[] = [];
-      const unsubscribe = onInternalDiagnosticEvent((event) => events.push(event));
-      const sendMatrix = vi.fn();
-      sendMatrix.mockRejectedValue(new TypeError("secret delivery body could not send"));
-      try {
-        await deliverMatrix({
-          cfg: matrixChunkConfig,
-          payloads: [{ text: "secret delivery body" }],
-          deps: { matrix: sendMatrix },
-          bestEffort: true,
-          session: { key: "session-1" },
-        });
-        await flushDiagnosticEvents();
-      } finally {
-        unsubscribe();
-      }
-      const deliveryEvents = events.filter((event) => event.type.startsWith("message.delivery."));
-      expect(deliveryEvents.map((event) => event.type)).toEqual([
-        "message.delivery.started",
-        `message.delivery.${outcome}`,
-      ]);
-      for (const event of deliveryEvents) {
-        expect(event).toMatchObject({
-          channel: "matrix",
-          deliveryKind: "text",
-          sessionKey: "session-1",
-        });
-      }
-      expect(deliveryEvents[1]).toMatchObject({
-        durationMs: expect.any(Number),
-        errorCategory: "TypeError",
-      });
-      expect(JSON.stringify(deliveryEvents)).not.toContain("secret delivery body");
-      expect(JSON.stringify(deliveryEvents)).not.toContain("!room:example");
-    },
-  );
+    }
+    expect(deliveryEvents[1]).toMatchObject({
+      durationMs: expect.any(Number),
+      errorCategory: "TypeError",
+    });
+    expect(JSON.stringify(deliveryEvents)).not.toContain("secret delivery body");
+    expect(JSON.stringify(deliveryEvents)).not.toContain("!room:example");
+  });
 
   it("emits one metadata-only audit terminal for a successful logical payload", async () => {
     const events: TrustedMessageAuditEvent[] = [];
@@ -2383,44 +2313,42 @@ describe("deliverOutboundPayloads", () => {
     hookMocks,
   });
 
-  it("logs a warning when failDelivery rejects on bestEffort partial failure (#83113)", async () => {
-    queueMocks.failDelivery.mockRejectedValueOnce(new Error("queue storage down"));
+  it.each([
+    { partial: true, error: "queue storage down" },
+    { partial: false, error: "db connection lost" },
+  ])(
+    "logs a warning when failDelivery rejects (partial=$partial, #83113)",
+    async ({ partial, error }) => {
+      queueMocks.failDelivery.mockRejectedValueOnce(new Error(error));
+      if (partial) {
+        await runBestEffortPartialFailureDelivery();
+        expect(queueMocks.failDelivery).toHaveBeenCalledWith(
+          "mock-queue-id",
+          "partial delivery failure (bestEffort)",
+        );
+      } else {
+        const sendMatrix = vi.fn().mockRejectedValue(new Error("native send failed"));
+        queueMocks.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
+          new Error("pre-send marker offline"),
+        );
 
-    await runBestEffortPartialFailureDelivery();
+        await expect(
+          deliverMatrix({
+            deps: { matrix: sendMatrix },
+            queuePolicy: "required",
+          }),
+        ).rejects.toThrow("pre-send marker offline");
 
-    expect(queueMocks.failDelivery).toHaveBeenCalledWith(
-      "mock-queue-id",
-      "partial delivery failure (bestEffort)",
-    );
-    const warnCall = requireMockCall(logMocks.warn, "warn");
-    const warnMessage = String(warnCall[0]);
-    expect(warnMessage).toContain("failed to mark queued delivery");
-    expect(warnMessage).toContain("mock-queue-id");
-    expect(warnMessage).toContain("queue storage down");
-  });
-
-  it("logs a warning when failDelivery rejects in the error handler (#83113)", async () => {
-    const sendMatrix = vi.fn().mockRejectedValue(new Error("native send failed"));
-    queueMocks.markDeliveryPlatformSendAttemptStarted.mockRejectedValueOnce(
-      new Error("pre-send marker offline"),
-    );
-    queueMocks.failDelivery.mockRejectedValueOnce(new Error("db connection lost"));
-
-    await expect(
-      deliverMatrix({
-        deps: { matrix: sendMatrix },
-        queuePolicy: "required",
-      }),
-    ).rejects.toThrow("pre-send marker offline");
-
-    expect(queueMocks.failDelivery).toHaveBeenCalledWith("mock-queue-id", expect.any(String));
-    expect(sendMatrix).not.toHaveBeenCalled();
-    const warnCall = requireMockCall(logMocks.warn, "warn");
-    const warnMessage = String(warnCall[0]);
-    expect(warnMessage).toContain("failed to mark queued delivery");
-    expect(warnMessage).toContain("mock-queue-id");
-    expect(warnMessage).toContain("db connection lost");
-  });
+        expect(queueMocks.failDelivery).toHaveBeenCalledWith("mock-queue-id", expect.any(String));
+        expect(sendMatrix).not.toHaveBeenCalled();
+      }
+      const warnCall = requireMockCall(logMocks.warn, "warn");
+      const warnMessage = String(warnCall[0]);
+      expect(warnMessage).toContain("failed to mark queued delivery");
+      expect(warnMessage).toContain("mock-queue-id");
+      expect(warnMessage).toContain(error);
+    },
+  );
 
   it("emits a stable terminal when best-effort marker fallback ack precedes provider rejection", async () => {
     hookMocks.runner.hasHooks.mockImplementation(
@@ -2770,34 +2698,24 @@ describe("deliverOutboundPayloads", () => {
     );
   });
 
-  it.each(["throws"] as const)(
-    "preserves the channel send when the post-delivery mirror %s",
-    async (failure) => {
-      const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
-      if (failure === "throws") {
-        mocks.appendAssistantMessageToSessionTranscript.mockRejectedValueOnce(
-          new Error("transcript mirror failed after channel delivery"),
-        );
-      } else {
-        mocks.appendAssistantMessageToSessionTranscript.mockResolvedValueOnce({
-          ok: false,
-          reason: "session locked",
-        });
-      }
-      const results = await deliverMatrix({
-        payloads: [{ text: "done" }],
-        deps: { matrix: sendMatrix },
-        mirror: { sessionKey: "agent:main:main", text: "done", idempotencyKey: "idem-89626" },
-      });
-      expect(sendMatrix).toHaveBeenCalledTimes(1);
-      expect(results).toHaveLength(1);
-      const warnCall = requireMockCall(logMocks.warn, "warn");
-      expect(warnCall[0]).toContain(
-        "failed to mirror outbound delivery into session transcript; channel send already succeeded",
-      );
-      expect(warnCall[1]).toMatchObject({ channel: "matrix", sessionKey: "agent:main:main" });
-    },
-  );
+  it("preserves the channel send when the post-delivery mirror throws", async () => {
+    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1", roomId: "!room:example" });
+    mocks.appendAssistantMessageToSessionTranscript.mockRejectedValueOnce(
+      new Error("transcript mirror failed after channel delivery"),
+    );
+    const results = await deliverMatrix({
+      payloads: [{ text: "done" }],
+      deps: { matrix: sendMatrix },
+      mirror: { sessionKey: "agent:main:main", text: "done", idempotencyKey: "idem-89626" },
+    });
+    expect(sendMatrix).toHaveBeenCalledTimes(1);
+    expect(results).toHaveLength(1);
+    const warnCall = requireMockCall(logMocks.warn, "warn");
+    expect(warnCall[0]).toContain(
+      "failed to mirror outbound delivery into session transcript; channel send already succeeded",
+    );
+    expect(warnCall[1]).toMatchObject({ channel: "matrix", sessionKey: "agent:main:main" });
+  });
 
   it("emits message_sent only after the durable queue terminal commits", async () => {
     hookMocks.runner.hasHooks.mockImplementation((name?: string) => name === "message_sent");
@@ -2826,74 +2744,63 @@ describe("deliverOutboundPayloads", () => {
     );
   });
 
-  it.each([["not_sent", "adapter_returned_no_send"]] as const)(
-    "does not count sendPayload outcome %s as delivered",
-    async (outcome, reason) => {
-      hookMocks.runner.hasHooks.mockReturnValue(true);
-      const sendText = vi.fn();
-      const pinDeliveredMessage = vi.fn<OutboundPinDeliveredMessage>();
-      const afterDeliverPayload = vi.fn();
-      const onPayloadDeliveryOutcome = vi.fn();
-      const sendPayload = installPayloadOutbound(
-        { channel: "matrix", messageId: "", ...(outcome ? { outcome } : {}) },
-        { sendText, sendTextOnlyErrorPayloads: true, pinDeliveredMessage, afterDeliverPayload },
-      );
+  it("does not count sendPayload outcome not_sent as delivered", async () => {
+    hookMocks.runner.hasHooks.mockReturnValue(true);
+    const sendText = vi.fn();
+    const pinDeliveredMessage = vi.fn<OutboundPinDeliveredMessage>();
+    const afterDeliverPayload = vi.fn();
+    const onPayloadDeliveryOutcome = vi.fn();
+    const sendPayload = installPayloadOutbound(
+      { channel: "matrix", messageId: "", outcome: "not_sent" },
+      { sendText, sendTextOnlyErrorPayloads: true, pinDeliveredMessage, afterDeliverPayload },
+    );
 
-      const results = await deliverMatrix({
-        to: "!room:1",
-        onPayloadDeliveryOutcome,
-        payloads: [
-          {
-            text: "provider exploded",
-            isError: true,
-            delivery: { pin: { enabled: true, required: true } },
-          },
-        ],
-        mirror: {
-          sessionKey: "agent:main:main",
-          agentId: "main",
+    const results = await deliverMatrix({
+      to: "!room:1",
+      onPayloadDeliveryOutcome,
+      payloads: [
+        {
           text: "provider exploded",
+          isError: true,
+          delivery: { pin: { enabled: true, required: true } },
         },
-      });
+      ],
+      mirror: {
+        sessionKey: "agent:main:main",
+        agentId: "main",
+        text: "provider exploded",
+      },
+    });
 
-      expect(results).toStrictEqual([]);
-      expect(sendPayload).toHaveBeenCalledTimes(1);
-      expect(sendText).not.toHaveBeenCalled();
-      expect(pinDeliveredMessage).not.toHaveBeenCalled();
-      expect(afterDeliverPayload).not.toHaveBeenCalled();
-      expect(hookMocks.runner.runMessageSent).not.toHaveBeenCalled();
-      expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
-      expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
-        index: 0,
-        status: "suppressed",
-        reason,
-      });
-    },
-  );
+    expect(results).toStrictEqual([]);
+    expect(sendPayload).toHaveBeenCalledTimes(1);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pinDeliveredMessage).not.toHaveBeenCalled();
+    expect(afterDeliverPayload).not.toHaveBeenCalled();
+    expect(hookMocks.runner.runMessageSent).not.toHaveBeenCalled();
+    expect(mocks.appendAssistantMessageToSessionTranscript).not.toHaveBeenCalled();
+    expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
+      index: 0,
+      status: "suppressed",
+      reason: "adapter_returned_no_send",
+    });
+  });
 
-  it.each([["empty result list", [], "adapter_returned_no_identity"]] as const)(
-    "records formatted text with %s honestly",
-    async (_label, outcomes, reason) => {
-      const onPayloadDeliveryOutcome = vi.fn();
-      setTestOutbound({
-        sendFormattedText: async () =>
-          outcomes.map((outcome) => ({
-            channel: "matrix",
-            messageId: "",
-            ...(outcome ? { outcome } : {}),
-          })),
-      });
+  it("records formatted text with an empty result list honestly", async () => {
+    const onPayloadDeliveryOutcome = vi.fn();
+    setTestOutbound({
+      sendFormattedText: async () => [],
+    });
 
-      const results = await deliverMatrix({ skipQueue: true, onPayloadDeliveryOutcome });
+    const results = await deliverMatrix({ skipQueue: true, onPayloadDeliveryOutcome });
 
-      expect(results).toEqual([]);
-      expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
-        index: 0,
-        status: "suppressed",
-        reason,
-      });
-    },
-  );
+    expect(results).toEqual([]);
+    expect(onPayloadDeliveryOutcome).toHaveBeenCalledWith({
+      index: 0,
+      status: "suppressed",
+      reason: "adapter_returned_no_identity",
+    });
+  });
 
   it("resets no-send disposition between chunked logical payloads", async () => {
     const onPayloadDeliveryOutcome = vi.fn();

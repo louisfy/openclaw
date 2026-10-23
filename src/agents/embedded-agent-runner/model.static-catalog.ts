@@ -1,3 +1,5 @@
+import { normalizeResolvedPricing } from "@openclaw/llm-core";
+import type { ModelCatalogRef as BundledStaticCatalogLookup } from "@openclaw/model-catalog-core/model-catalog-refs";
 import type { NormalizedModelCatalogRow } from "@openclaw/model-catalog-core/model-catalog-types";
 import {
   findNormalizedProviderValue,
@@ -33,16 +35,44 @@ import {
 } from "../../plugins/providers.js";
 import type { PluginRegistry } from "../../plugins/registry-types.js";
 import { dedupeByKey } from "../../shared/dedupe-by-key.js";
+import { getOrCreatePromise } from "../../shared/lazy-promise.js";
+import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
 import { modelTransportRoutesMatch } from "../model-compat-catalog.js";
 import { resolveBuiltInModelSuppressionFromManifest } from "../model-suppression.js";
-import { buildInlineProviderModels, completeInlineProviderModel } from "./model.inline-provider.js";
+import {
+  buildInlineProviderModels,
+  completeInlineProviderModel,
+  resolveProviderModelInput,
+} from "./model.inline-provider.js";
 import { resolveProviderTransport } from "./model.provider-transport.js";
-import { modelFromStaticCatalogRow } from "./model.static-catalog-row.js";
 import type { BundledStaticCatalogState } from "./model.static-catalog.types.js";
 import { createStaticModelIdMatcher, staticModelIdMatches } from "./model.static-id.js";
 
 export { resolveManifestModelCatalogProviderAliasMetadata } from "./model.manifest-alias.js";
 export type { ManifestModelCatalogProviderAliasMetadata } from "./model.manifest-alias.js";
+
+function modelFromStaticCatalogRow(row: NormalizedModelCatalogRow): ProviderRuntimeModel {
+  return {
+    id: row.id,
+    name: row.name || row.id,
+    provider: row.provider,
+    api: row.api ?? "openai-responses",
+    baseUrl: row.baseUrl ?? "",
+    reasoning: row.reasoning,
+    input: resolveProviderModelInput({ input: row.input }),
+    cost: normalizeResolvedPricing(row.cost ?? {}),
+    contextWindow: row.contextWindow ?? DEFAULT_CONTEXT_TOKENS,
+    contextWindows: row.contextWindows?.map((option) => ({ ...option })),
+    contextWindowDefault: row.contextWindowDefault,
+    contextTokens: row.contextTokens,
+    ...(row.parameterCount !== undefined ? { parameterCount: row.parameterCount } : {}),
+    maxTokens: row.maxTokens ?? DEFAULT_CONTEXT_TOKENS,
+    thinkingLevelMap: row.thinkingLevelMap ? { ...row.thinkingLevelMap } : undefined,
+    headers: row.headers,
+    compat: row.compat,
+    mediaInput: row.mediaInput,
+  };
+}
 
 type StaticCatalogPlugin = Parameters<
   typeof planEffectiveModelCatalogRows
@@ -136,14 +166,10 @@ function resolveBundledStaticCatalogState(
   return state;
 }
 
-type BundledStaticCatalogLookup = {
-  provider: string;
-  modelId: string;
-};
-
 type BundledStaticCatalogContext = {
   contextWindow?: number;
   contextTokens?: number;
+  contextWindowSource?: "synthetic";
 };
 
 type BundledStaticCatalogScopedLookup = {
@@ -164,10 +190,8 @@ export function createBundledStaticCatalogModelResolver(
   params?: Partial<BundledStaticCatalogParams> & { includeRuntimeDiscovery?: boolean },
 ): (lookup: BundledStaticCatalogLookup) => ProviderRuntimeModel | undefined {
   const catalogParams = {
-    cfg: params?.cfg,
+    ...params,
     env: params?.env ?? process.env,
-    ...(params?.metadataSnapshot ? { metadataSnapshot: params.metadataSnapshot } : {}),
-    workspaceDir: params?.workspaceDir,
   };
   const matchesStaticModelId = params?.metadataSnapshot
     ? createStaticModelIdMatcher({ manifestPlugins: params.metadataSnapshot })
@@ -195,23 +219,26 @@ export function createBundledStaticCatalogModelResolver(
       }
       return plan;
     };
-    const acceptsDiscovery = (discovery: string | undefined) =>
-      discovery === "static" ||
-      (params?.includeRuntimeDiscovery && (discovery === "runtime" || discovery === "refreshable"));
-    const plan = getPlan(provider);
-    for (const entry of plan.entries) {
-      if (!acceptsDiscovery(entry.discovery)) {
-        continue;
+    function* acceptedRows(plan: ReturnType<typeof getPlan>) {
+      for (const entry of plan.entries) {
+        if (
+          entry.discovery === "static" ||
+          (params?.includeRuntimeDiscovery &&
+            (entry.discovery === "runtime" || entry.discovery === "refreshable"))
+        ) {
+          yield* entry.rows;
+        }
       }
-      const row = entry.rows.find((candidate: NormalizedModelCatalogRow) =>
+    }
+    for (const row of acceptedRows(getPlan(provider))) {
+      if (
         matchesStaticModelId({
-          candidateId: candidate.id,
+          candidateId: row.id,
           provider,
           modelId: lookup.modelId,
-          rowProvider: candidate.provider,
-        }),
-      );
-      if (row) {
+          rowProvider: row.provider,
+        })
+      ) {
         return modelFromStaticCatalogRow(row);
       }
     }
@@ -237,57 +264,48 @@ export function createBundledStaticCatalogModelResolver(
       lookup.modelId.trim(),
       params?.includeRuntimeDiscovery === true,
     ]);
-    const cachedDonor = state.donorRows.get(donorKey);
-    if (cachedDonor !== undefined) {
-      return cachedDonor ? { ...modelFromStaticCatalogRow(cachedDonor), provider } : undefined;
-    }
-    const findDonor = (): NormalizedModelCatalogRow | undefined => {
+    let donor = state.donorRows.get(donorKey);
+    if (donor === undefined) {
       const donors = getPlan();
-      let donor: NormalizedModelCatalogRow | undefined;
-      for (const entry of donors.entries) {
-        if (!acceptsDiscovery(entry.discovery)) {
+      donor = null;
+      for (const row of acceptedRows(donors)) {
+        if (row.id !== lookup.modelId.trim()) {
           continue;
         }
-        for (const row of entry.rows) {
-          if (row.id !== lookup.modelId.trim()) {
-            continue;
-          }
-          const route = resolveProviderTransport({
-            provider: row.provider,
-            modelId: row.id,
-            ...configuredRoute,
-            cfg: projectModelProviderConfig(params?.cfg, row.provider, configuredRoute),
-            workspaceDir: params?.workspaceDir,
-          });
-          if (!route.baseUrl || !modelTransportRoutesMatch(row, route)) {
-            continue;
-          }
-          if (
-            donor ||
-            donors.conflicts.some(
-              (conflict) => conflict.provider === row.provider && conflict.modelId === row.id,
-            ) ||
-            resolveBuiltInModelSuppressionFromManifest({
-              provider: row.provider,
-              id: row.id,
-              baseUrl: route.baseUrl,
-              config: projectModelProviderConfig(params?.cfg, row.provider, {
-                api: row.api,
-                baseUrl: route.baseUrl,
-              }),
-              workspaceDir: params?.workspaceDir,
-              metadataSnapshot,
-            })?.suppress
-          ) {
-            return undefined;
-          }
-          donor = row;
+        const route = resolveProviderTransport({
+          provider: row.provider,
+          modelId: row.id,
+          ...configuredRoute,
+          cfg: projectModelProviderConfig(params?.cfg, row.provider, configuredRoute),
+          workspaceDir: params?.workspaceDir,
+        });
+        if (!route.baseUrl || !modelTransportRoutesMatch(row, route)) {
+          continue;
         }
+        if (
+          donor ||
+          donors.conflicts.some(
+            (conflict) => conflict.provider === row.provider && conflict.modelId === row.id,
+          ) ||
+          resolveBuiltInModelSuppressionFromManifest({
+            provider: row.provider,
+            id: row.id,
+            baseUrl: route.baseUrl,
+            config: projectModelProviderConfig(params?.cfg, row.provider, {
+              api: row.api,
+              baseUrl: route.baseUrl,
+            }),
+            workspaceDir: params?.workspaceDir,
+            metadataSnapshot,
+          })?.suppress
+        ) {
+          donor = null;
+          break;
+        }
+        donor = row;
       }
-      return donor;
-    };
-    const donor = findDonor();
-    state.donorRows.set(donorKey, donor ?? null);
+      state.donorRows.set(donorKey, donor);
+    }
     return donor ? { ...modelFromStaticCatalogRow(donor), provider } : undefined;
   };
 }
@@ -445,10 +463,8 @@ export async function loadBundledProviderStaticCatalogContextModels(
 ): Promise<ProviderRuntimeModel[]> {
   const env = params.env ?? process.env;
   const metadataSnapshot = resolveBundledStaticCatalogMetadataSnapshot({
-    cfg: params.cfg,
+    ...params,
     env,
-    ...(params.metadataSnapshot ? { metadataSnapshot: params.metadataSnapshot } : {}),
-    workspaceDir: params.workspaceDir,
   });
   const preparedStaticProviderCatalog = {
     providers: dedupeByKey(
@@ -481,11 +497,10 @@ export async function loadBundledProviderStaticCatalogContextModels(
   }
   const providerScopedPluginIds = params.providerIds?.flatMap((provider) =>
     resolveBundledProviderStaticCatalogPluginIds({
+      ...params,
       provider,
-      cfg: params.cfg,
-      workspaceDir: params.workspaceDir,
       env,
-      ...(metadataSnapshot ? { metadataSnapshot } : {}),
+      metadataSnapshot,
     }),
   );
   const candidatePluginIds =
@@ -539,11 +554,9 @@ function createScopedBundledProviderStaticCatalogModelResolver(
     let pluginIds = scopedPluginIds ?? providerPluginIds.get(provider);
     if (!pluginIds) {
       pluginIds = resolveBundledProviderStaticCatalogPluginIds({
+        ...params,
         provider,
-        cfg: params.cfg,
-        workspaceDir: params.workspaceDir,
         env,
-        ...(params.metadataSnapshot ? { metadataSnapshot: params.metadataSnapshot } : {}),
       });
       providerPluginIds.set(provider, pluginIds);
     }
@@ -551,15 +564,13 @@ function createScopedBundledProviderStaticCatalogModelResolver(
       return undefined;
     }
     const catalogKey = pluginIds.join("\0");
-    let catalog = pluginCatalogs.get(catalogKey);
-    if (!catalog) {
-      catalog = loadBundledProviderStaticCatalogModels({
+    const catalog = getOrCreatePromise(pluginCatalogs, catalogKey, () =>
+      loadBundledProviderStaticCatalogModels({
         pluginIds,
         ...params,
         env,
-      });
-      pluginCatalogs.set(catalogKey, catalog);
-    }
+      }),
+    );
     return ((await catalog).get(provider) ?? []).find((candidate) =>
       matchesStaticModelId({
         candidateId: candidate.id,
@@ -588,13 +599,9 @@ function resolveOwnedNestedProviderLookup(params: {
   }
   const resolveBundledOwners = (candidateProvider: string) =>
     resolveBundledProviderStaticCatalogPluginIds({
+      ...params.resolverParams,
       provider: candidateProvider,
-      cfg: params.resolverParams.cfg,
-      workspaceDir: params.resolverParams.workspaceDir,
       env: params.env,
-      ...(params.resolverParams.metadataSnapshot
-        ? { metadataSnapshot: params.resolverParams.metadataSnapshot }
-        : {}),
     });
   const nestedProviderOwners = new Set(resolveBundledOwners(nestedProvider));
   const sharedPluginIds = resolveBundledOwners(provider).filter((pluginId) =>
@@ -635,6 +642,7 @@ export function createBundledProviderStaticCatalogContextResolver(
       ...(typeof model.contextTokens === "number" && model.contextTokens > 0
         ? { contextTokens: model.contextTokens }
         : {}),
+      ...(model.contextWindowSource ? { contextWindowSource: model.contextWindowSource } : {}),
     };
   };
 }

@@ -4,7 +4,7 @@
  */
 import { normalizeAgentId } from "../../../routing/session-key.js";
 
-type SubagentTargetPolicyResult = { ok: true } | { ok: false; allowedText: string; error: string };
+type SubagentTargetPolicyResult = { ok: true } | { ok: false; error: string };
 
 function normalizeAllowAgents(allowAgents: readonly string[] | undefined): Set<string> | undefined {
   if (!Array.isArray(allowAgents)) {
@@ -72,16 +72,11 @@ export function resolveSubagentTargetPolicy(params: {
   }
   const allowedText = allowed.allowedIds.length > 0 ? allowed.allowedIds.join(", ") : "none";
   const policy = normalizeAllowAgents(params.allowAgents);
-  if (allowed.allowAny || policy?.has(targetAgentId)) {
-    return {
-      ok: false,
-      allowedText,
-      error: `agentId "${targetAgentId}" is not in the configured agent registry (allowed: ${allowedText})`,
-    };
-  }
   return {
     ok: false,
-    allowedText,
-    error: `agentId is not allowed for sessions_spawn (allowed: ${allowedText})`,
+    error:
+      allowed.allowAny || policy?.has(targetAgentId)
+        ? `agentId "${targetAgentId}" is not in the configured agent registry (allowed: ${allowedText})`
+        : `agentId is not allowed for sessions_spawn (allowed: ${allowedText})`,
   };
 }

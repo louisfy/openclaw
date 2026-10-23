@@ -1,6 +1,6 @@
 import type { GatewaySessionRow } from "../../api/types.ts";
 import { resolveSessionDisplayName } from "../../lib/session-display.ts";
-import { isSessionRunActive } from "../../lib/session-run-state.ts";
+import { isSessionRunStateActive } from "../../lib/session-run-state.ts";
 import {
   areUiSessionKeysEquivalent,
   isDashboardSessionKey,
@@ -8,6 +8,7 @@ import {
 } from "../../lib/sessions/session-key.ts";
 import { pendingSessionsYield } from "./chat-sessions-yield.ts";
 import {
+  endedWithoutFinishing,
   isSubagentsPanelSession,
   isUnfinishedSubagent,
   spawnedSubagentsRenderKey,
@@ -15,55 +16,32 @@ import {
 } from "./chat-spawned-subagent.ts";
 
 export type ChatSubagentWait = {
-  /** When the parent handed off; null when loaded history cannot place it. */
-  startedAt: number | null;
+  /** The persisted end of the parent’s latest turn, independent of loaded history. */
+  startedAt: number;
   /** The handed-off run, so the wait stays that run's live status. */
   runId?: string;
   /** Unfinished direct subagents; 0 until the pane's own child query has answered. */
   runningCount: number;
   /** Unfinished child sessions that are not subagents; the wait names none of them. */
   sessionCount?: number;
-  child?: { key: string; label: string };
+  child?: { key: string; label: string; startedAt?: number | null };
 };
 
-/**
- * A wait behind a loaded handoff is that run's own status. Any other wait
- * follows a turn that already ended, so it stays a row after the transcript.
- */
-function placedSubagentWait(
-  wait: ChatSubagentWait | null,
-): { startedAt: number; runId: string } | undefined {
-  return wait?.runId && wait.startedAt !== null
-    ? { startedAt: wait.startedAt, runId: wait.runId }
-    : undefined;
-}
-
-/**
- * Everything the working line draws about subagents, so rows without one keep
- * memoizing across roster patches.
- */
-function subagentStatusRenderKey(
-  wait: ChatSubagentWait | null,
-  running: number,
-  listed: boolean,
-): string {
-  return JSON.stringify(
-    wait
-      ? [
-          wait.startedAt,
-          wait.runningCount,
-          wait.sessionCount,
-          wait.child?.key,
-          wait.child?.label,
-          listed,
-        ]
-      : [running, listed],
-  );
-}
+export type ChatSubagentActivity = {
+  session: GatewaySessionRow;
+  key: string;
+  label: string;
+  /** Only the Details list reports settled children; the transcript shows unfinished ones. */
+  status: "queued" | "running" | "waiting" | "done" | "failed" | "stopped";
+  activity?: string;
+  /** The current run's plan steps; only the live observer stream reports them. */
+  progress?: { completed: number; total: number };
+  listed: boolean;
+};
 
 // A count or a name says which children are left, so it waits for the pane's
 // own child query. Rows seeded from another list can hold only some of them.
-function unfinishedChildren(session: GatewaySessionRow, roster: SubagentRoster) {
+function directChildren(session: GatewaySessionRow, roster: SubagentRoster) {
   if (!roster.subagentSessionsHydrated) {
     return [];
   }
@@ -71,7 +49,6 @@ function unfinishedChildren(session: GatewaySessionRow, roster: SubagentRoster) 
     const parent = resolveUiSessionNavigationParentKey(row);
     return (
       !row.archived &&
-      isUnfinishedSubagent(row) &&
       !areUiSessionKeysEquivalent(row.key, session.key) &&
       (parent
         ? areUiSessionKeysEquivalent(parent, session.key)
@@ -80,75 +57,74 @@ function unfinishedChildren(session: GatewaySessionRow, roster: SubagentRoster) 
   });
 }
 
-/**
- * Unfinished direct subagents to mention beside the session's own work; 0 when
- * unknown. Child sessions opened in their own right are not subagents.
- */
-function countRunningSubagents(
-  input: SubagentRoster & { selectedSession: GatewaySessionRow | undefined },
-): number {
+type SubagentSession = SubagentRoster & { selectedSession: GatewaySessionRow | undefined };
+
+function unfinishedChildren(input: SubagentSession) {
   const session = input.selectedSession;
-  return session && !session.archived && session.hasActiveSubagentRun === true
-    ? unfinishedChildren(session, input).filter((row) => !isDashboardSessionKey(row.key)).length
-    : 0;
+  if (!session || session.archived || session.hasActiveSubagentRun !== true) {
+    return [];
+  }
+  return directChildren(session, input).filter(
+    (row) => row.status === "queued" || isUnfinishedSubagent(row),
+  );
 }
 
-export function resolveChatSubagentWait(
-  input: SubagentRoster & {
-    selectedSession: GatewaySessionRow | undefined;
-    runActive?: boolean;
-    runWorking?: boolean;
-    messages: readonly unknown[];
-  },
-): ChatSubagentWait | null {
-  const session = input.selectedSession;
-  if (
-    !session ||
-    session.archived ||
-    session.hasActiveSubagentRun !== true ||
-    input.runActive ||
-    input.runWorking ||
-    isSessionRunActive(session)
-  ) {
-    return null;
-  }
-  const pending = pendingSessionsYield(input.messages);
-  const yieldedAt = pending?.timestamp ?? null;
-  const handoffAt =
-    yieldedAt !== null && typeof session.startedAt === "number" && yieldedAt > session.startedAt
-      ? yieldedAt
-      : null;
-  const unfinished = unfinishedChildren(session, input);
-  if (input.subagentSessionsHydrated && unfinished.length === 0) {
-    // Every child the pane knows has finished. The resumed run draws the next
-    // status; a wait line here could only say it is waiting on nothing.
-    return null;
-  }
-  // A child session opened in its own right is not a subagent: it is counted
-  // without a name, and only once no subagent is left.
-  const children = unfinished.filter((row) => !isDashboardSessionKey(row.key));
-  const child = children.length === 1 ? children[0] : undefined;
+/** Header counts need child membership, not transcript handoffs or activity presentation. */
+export function countRunningSubagents(input: SubagentSession): number {
+  return unfinishedChildren(input).filter((row) => !isDashboardSessionKey(row.key)).length;
+}
+
+// Launch order stays stable as activity updates reorder the source roster.
+function byLaunch(a: GatewaySessionRow, b: GatewaySessionRow) {
+  return (
+    (a.createdAt ?? a.startedAt ?? 0) - (b.createdAt ?? b.startedAt ?? 0) ||
+    a.key.localeCompare(b.key)
+  );
+}
+
+function toActivity(
+  row: GatewaySessionRow,
+  status: ChatSubagentActivity["status"],
+): ChatSubagentActivity {
+  const digest = row.observerDigest;
   return {
-    // The yield's transcript row can predate the handoff by its whole wrapping
-    // step; the parent's run end is the handoff itself.
-    startedAt:
-      handoffAt !== null && typeof session.endedAt === "number" && session.endedAt >= handoffAt
-        ? session.endedAt
-        : handoffAt,
-    ...(handoffAt !== null && pending?.runId ? { runId: pending.runId } : {}),
-    runningCount: children.length,
-    ...(unfinished.length > children.length
-      ? { sessionCount: unfinished.length - children.length }
-      : {}),
-    ...(child
-      ? {
-          child: {
-            key: child.key,
-            label: resolveSessionDisplayName(child.key, child),
-          },
-        }
-      : {}),
+    session: row,
+    key: row.key,
+    label: resolveSessionDisplayName(row.key, row),
+    status,
+    // A retained headline from the previous run is not current activity.
+    activity:
+      status === "running" && digest?.runId && row.activeRunIds?.includes(digest.runId)
+        ? digest.headline.trim() || undefined
+        : undefined,
+    listed: isSubagentsPanelSession(row),
   };
+}
+
+function unfinishedStatus(row: GatewaySessionRow): ChatSubagentActivity["status"] {
+  return row.status === "queued" ? "queued" : isSessionRunStateActive(row) ? "running" : "waiting";
+}
+
+/**
+ * Every direct subagent the pane's own child query returned, finished ones
+ * included. Dashboard children are sessions in their own right and are left out.
+ */
+export function listSubagents(input: SubagentSession): ChatSubagentActivity[] {
+  const session = input.selectedSession;
+  if (!session || session.archived) {
+    return [];
+  }
+  return directChildren(session, input)
+    .filter((row) => !isDashboardSessionKey(row.key))
+    .toSorted(byLaunch)
+    .map((row) =>
+      toActivity(
+        row,
+        row.status === "queued" || isUnfinishedSubagent(row)
+          ? unfinishedStatus(row)
+          : (endedWithoutFinishing(row) ?? "done"),
+      ),
+    );
 }
 
 /**
@@ -157,27 +133,108 @@ export function resolveChatSubagentWait(
  * memoized rows when any of it changed.
  */
 export function projectSubagentStatus(
-  input: Parameters<typeof resolveChatSubagentWait>[0],
+  input: SubagentSession & {
+    runActive?: boolean;
+    runWorking?: boolean;
+    messages: readonly unknown[];
+  },
   searchFiltering: boolean,
 ) {
-  const wait = resolveChatSubagentWait(input);
-  const running = countRunningSubagents(input);
   const session = input.selectedSession;
+  const eligible = session && !session.archived && session.hasActiveSubagentRun === true;
+  // Descendant activity alone is not a parent wait: plugin-owned children can
+  // belong to a session that has never executed. Every settled parent turn has
+  // a lifecycle end; a partial row must not invent that boundary from transcript text.
+  const parentIdle =
+    eligible && !input.runActive && !input.runWorking && !isSessionRunStateActive(session);
+  const endedAt = session?.endedAt;
+  const waitStartedAt =
+    parentIdle &&
+    typeof endedAt === "number" &&
+    Number.isFinite(endedAt) &&
+    endedAt > 0 &&
+    endedAt >= (session?.startedAt ?? 0)
+      ? endedAt
+      : null;
+  const pending = waitStartedAt !== null ? pendingSessionsYield(input.messages) : null;
+  const yieldedAt = pending?.timestamp ?? null;
+  const handoffRunId =
+    yieldedAt !== null &&
+    typeof session?.startedAt === "number" &&
+    yieldedAt > session.startedAt &&
+    waitStartedAt !== null &&
+    yieldedAt <= waitStartedAt
+      ? pending?.runId
+      : undefined;
+  const unfinished = unfinishedChildren(input);
+  // Dashboard children count as sessions, never named subagents.
+  const children = unfinished.filter((row) => !isDashboardSessionKey(row.key));
+  const running = children.length;
+  const hydrated = input.subagentSessionsHydrated && !input.subagentSessionsPending;
+  const child = hydrated && running === 1 ? children[0] : undefined;
+  // The roster already carries live observer headlines; no child transcript
+  // reads or second execution/status owner are needed for inline progress.
+  const activity: ChatSubagentActivity[] = searchFiltering
+    ? []
+    : children.toSorted(byLaunch).map((row) => toActivity(row, unfinishedStatus(row)));
+  // A hydrated roster with no unfinished children ends the wait.
+  const wait: ChatSubagentWait | null =
+    waitStartedAt !== null && (!hydrated || unfinished.length > 0)
+      ? {
+          startedAt: waitStartedAt,
+          ...(handoffRunId ? { runId: handoffRunId } : {}),
+          runningCount: hydrated ? running : 0,
+          ...(hydrated && unfinished.length > running
+            ? { sessionCount: unfinished.length - running }
+            : {}),
+          ...(child
+            ? {
+                child: {
+                  key: child.key,
+                  label: resolveSessionDisplayName(child.key, child),
+                  startedAt: child.startedAt,
+                },
+              }
+            : {}),
+        }
+      : null;
   // The line can lead to the Subagents panel only when that panel lists every
   // subagent it mentions.
   const listed =
-    session !== undefined &&
     (wait !== null || running > 0) &&
-    unfinishedChildren(session, input).every(
-      (row) => isDashboardSessionKey(row.key) || isSubagentsPanelSession(row),
-    );
+    unfinished.every((row) => isDashboardSessionKey(row.key) || isSubagentsPanelSession(row));
   return {
     wait,
-    // Search results omit the live wait line.
-    placedWait: searchFiltering ? undefined : placedSubagentWait(wait),
+    // Only a loaded handoff places the wait inside its run; search omits it.
+    placedWait:
+      !searchFiltering && wait?.runId
+        ? { startedAt: wait.startedAt, runId: wait.runId }
+        : undefined,
     running,
+    activity,
     listed,
-    statusKey: subagentStatusRenderKey(wait, running, listed),
+    // Key only the working line's facts so unrelated roster patches stay memoized.
+    statusKey: JSON.stringify([
+      wait
+        ? [
+            wait.startedAt,
+            wait.runningCount,
+            wait.sessionCount,
+            wait.child?.key,
+            wait.child?.label,
+            wait.child?.startedAt,
+            listed,
+          ]
+        : [running, listed],
+      activity.map(({ session: row, ...display }) => [
+        display,
+        row.sessionId,
+        row.lifecycleRevision,
+        row.agentId,
+        row.activeRunIds,
+        row.observerDigest,
+      ]),
+    ]),
     rowsKey: spawnedSubagentsRenderKey(input.subagentSessions),
   };
 }

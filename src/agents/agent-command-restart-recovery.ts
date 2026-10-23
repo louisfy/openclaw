@@ -1,68 +1,34 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { ReplyPayload } from "../auto-reply/reply-payload.js";
 import { createSessionWorkStartChangedError } from "../config/sessions/lifecycle.js";
-import { hasMainSessionRecoveryClaim } from "../config/sessions/restart-recovery-state.js";
+import { resolveRestartRecoveryTerminalDeliveryDisposition } from "../config/sessions/restart-recovery-receipt-state.js";
+import {
+  hasMainSessionRecoveryClaim,
+  hasRestartRecoveryTerminalRun,
+} from "../config/sessions/restart-recovery-state.js";
 import type {
   HarnessCompletionRecovery,
   RestartRecoveryTerminalDeliveryEvidenceResult,
 } from "../config/sessions/restart-recovery-types.js";
-import type { SessionEntry } from "../config/sessions/types.js";
-import { isAgentMediatedCompletionSourceTool } from "../sessions/input-provenance.js";
+import type { InternalSessionEntry as SessionEntry } from "../config/sessions/types.js";
 import type { DeliveryContext } from "../utils/delivery-context.shared.js";
 import {
   captureHarnessCompletionRecovery,
   createHarnessCompletionSourceAssertion,
   getOwedHarnessCompletionTask,
 } from "./agent-harness-completion-recovery.js";
+import { normalizeAgentRunTerminalReplySnapshot } from "./agent-run-terminal-reply.js";
 import type { AgentCommandOpts } from "./command/types.js";
 import {
   collectDeliveredMediaUrls,
   collectMessagingToolDeliveredMediaUrls,
+  getAutomaticDeliveryEvidence,
   hasCommittedOutboundDeliveryEvidence,
   hasUnaccountedMessagingToolAggregateEvidence,
   hasVisibleAgentPayload,
   hasVisibleCommittedMessagingToolDeliveryEvidence,
   type AgentDeliveryEvidence,
 } from "./embedded-agent-runner/delivery-evidence.js";
-import { mergeAttemptToolMediaPayloads } from "./embedded-agent-runner/run/tool-media-payloads.js";
-
-/** Restore the exact host-owned delivery constraints before starting a recovery turn. */
-export function resolveCommandRecoveryOptions(params: {
-  opts: AgentCommandOpts;
-  sessionEntry?: SessionEntry;
-  runId: string;
-}): AgentCommandOpts {
-  const { sessionEntry: entry } = params;
-  const media =
-    entry?.restartRecoveryDeliveryRunId === params.runId &&
-    Array.isArray(entry.restartRecoveryDeliveryMediaUrls)
-      ? entry.restartRecoveryDeliveryMediaUrls
-      : undefined;
-  const opts =
-    media !== undefined
-      ? {
-          ...params.opts,
-          internalDeliveryMediaUrls: [...media],
-          internalDeliverySuppressText: entry?.restartRecoverySuppressTextDelivery,
-          sourceReplyDeliveryMode: entry?.restartRecoverySourceReplyDeliveryMode,
-          disableMessageTool: entry?.restartRecoveryDisableMessageTool,
-          forceRestartSafeTools: entry?.restartRecoveryForceSafeTools,
-        }
-      : params.opts;
-  if (
-    (opts.internalDeliverySuppressText === true && opts.internalDeliveryMediaUrls === undefined) ||
-    ((opts.internalDeliveryMediaUrls !== undefined || opts.internalDeliverySuppressText === true) &&
-      (opts.forceRestartSafeTools !== true ||
-        opts.disableMessageTool !== true ||
-        opts.sourceReplyDeliveryMode !== "automatic"))
-  ) {
-    throw new Error(
-      "internal delivery media constraints require automatic delivery with restart-safe tools and no message tool",
-    );
-  }
-  return opts;
-}
 
 function normalizeOptionalThreadId(value: unknown): string | undefined {
   return (
@@ -71,82 +37,22 @@ function normalizeOptionalThreadId(value: unknown): string | undefined {
   );
 }
 
-/** Replace model-selected media with the exact host-owned delivery set. */
-export function constrainRestartRecoveryDeliveryPayloads(
-  payloads: ReplyPayload[] | undefined,
-  mediaUrls: string[],
-  suppressText = false,
-): ReplyPayload[] {
-  const constrained: ReplyPayload[] = [];
-  for (const payload of payloads ?? []) {
-    const constrainedPayload: ReplyPayload = {};
-    if (!suppressText && typeof payload.text === "string") {
-      constrainedPayload.text = payload.text;
-    }
-    for (const flag of [
-      "isError",
-      "isReasoning",
-      "isCommentary",
-      "isReasoningSnapshot",
-      "isCompactionNotice",
-      "isFallbackNotice",
-      "isStatusNotice",
-    ] as const) {
-      if (payload[flag] === true) {
-        constrainedPayload[flag] = true;
-      }
-    }
-    if (Object.keys(constrainedPayload).length > 0) {
-      constrained.push(constrainedPayload);
-    }
-  }
-  const exactMediaUrls = Array.from(
-    new Set(mediaUrls.map((url) => url.trim()).filter((url) => url.length > 0)),
-  );
-  if (exactMediaUrls.length === 0) {
-    return constrained;
-  }
-
-  if (!suppressText) {
-    const visibleReplyIndex = constrained.findIndex((payload) =>
-      hasVisibleAgentPayload(
-        { payloads: [payload] },
-        {
-          includeErrorPayloads: false,
-          includeSilentReplyPayloads: false,
-          requireTerminalContent: true,
-        },
-      ),
-    );
-    if (visibleReplyIndex >= 0) {
-      const visibleReply = constrained[visibleReplyIndex];
-      if (visibleReply) {
-        // Recovery owns the exact artifacts; merge them with the actual final
-        // reply so automatic delivery cannot emit a caption before its media.
-        const [mergedReply] =
-          mergeAttemptToolMediaPayloads({
-            payloads: [visibleReply],
-            toolMediaUrls: exactMediaUrls,
-            hostOwnedToolMediaUrls: exactMediaUrls,
-            toolTrustedLocalMedia: true,
-            sourceReplyDeliveryMode: "automatic",
-          }) ?? [];
-        if (mergedReply) {
-          constrained[visibleReplyIndex] = mergedReply;
-          return constrained;
-        }
-      }
-    }
-  }
-
-  constrained.push({ mediaUrls: exactMediaUrls, trustedLocalMedia: true });
-  return constrained;
-}
+type RestartRecoveryTerminalDeliveryInput = Omit<AgentDeliveryEvidence, "deliveryStatus"> &
+  Pick<RestartRecoveryTerminalDeliveryEvidenceResult, "deliveryStatus">;
 
 /** Reduce a terminal result to bounded, route-checkable delivery evidence. */
 export function buildRestartRecoveryTerminalDeliveryEvidence(
-  result: AgentDeliveryEvidence,
+  result: RestartRecoveryTerminalDeliveryInput,
 ): RestartRecoveryTerminalDeliveryEvidenceResult {
+  const terminalReply = normalizeAgentRunTerminalReplySnapshot(result.meta?.terminalReply);
+  const silent = terminalReply?.disposition === "silent";
+  const meta: RestartRecoveryTerminalDeliveryEvidenceResult["meta"] = {
+    ...(silent ? { terminalReply: { disposition: "silent" as const } } : {}),
+    ...(result.meta?.yielded === true ? { yielded: true as const } : {}),
+    ...(result.meta?.continuationPending === true ? { continuationPending: true as const } : {}),
+    ...(result.meta?.aborted ? { aborted: true as const } : {}),
+    ...(result.meta?.error ? { error: true as const } : {}),
+  };
   const rawPayloads = Array.isArray(result.payloads) ? result.payloads : undefined;
   const payloads: RestartRecoveryTerminalDeliveryEvidenceResult["payloads"] = rawPayloads
     ?.slice(0, 64)
@@ -158,7 +64,6 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
           requireTerminalContent: true,
           includeErrorPayloads: false,
           includeReasoningPayloads: false,
-          includeSilentReplyPayloads: false,
         },
       );
       const evidence: { mediaUrls?: string[]; visible?: boolean } = { visible };
@@ -169,52 +74,54 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
     });
   const payloadsTruncated = rawPayloads && rawPayloads.length > 64 ? (true as const) : undefined;
   const rawDeliveryStatus = result.deliveryStatus;
-  const status =
-    rawDeliveryStatus?.status === "failed" ||
-    rawDeliveryStatus?.status === "partial_failed" ||
-    rawDeliveryStatus?.status === "sent" ||
-    rawDeliveryStatus?.status === "suppressed"
-      ? rawDeliveryStatus.status
-      : undefined;
-  const rawPayloadOutcomes =
-    rawDeliveryStatus && typeof rawDeliveryStatus === "object"
-      ? (rawDeliveryStatus as { payloadOutcomes?: unknown }).payloadOutcomes
-      : undefined;
-  const payloadOutcomes: NonNullable<
-    RestartRecoveryTerminalDeliveryEvidenceResult["deliveryStatus"]
-  >["payloadOutcomes"] = Array.isArray(rawPayloadOutcomes)
-    ? rawPayloadOutcomes.flatMap((record) => {
-        if (!isRecord(record)) {
-          return [];
-        }
-        const outcomeStatus =
-          record.status === "failed" || record.status === "sent" || record.status === "suppressed"
-            ? record.status
-            : undefined;
-        if (!outcomeStatus || typeof record.index !== "number" || !Number.isInteger(record.index)) {
-          return [];
-        }
-        return [
-          {
-            index: record.index,
-            status: outcomeStatus,
-            ...(typeof record.sentBeforeError === "boolean"
-              ? { sentBeforeError: record.sentBeforeError }
-              : {}),
-          },
-        ];
-      })
-    : undefined;
+  const status = rawDeliveryStatus?.status;
+  const rawPayloadOutcomes = rawDeliveryStatus?.payloadOutcomes;
+  const retainedPayloadOutcomes = rawPayloadOutcomes?.slice(0, 64);
+  if (
+    retainedPayloadOutcomes &&
+    rawPayloadOutcomes &&
+    rawPayloadOutcomes.length > 64 &&
+    !getAutomaticDeliveryEvidence({
+      deliveryStatus: { payloadOutcomes: retainedPayloadOutcomes },
+    }).mayHaveSent
+  ) {
+    // Truncation must not turn an omitted committed/ambiguous send into a safe non-send.
+    const sendEvidence = rawPayloadOutcomes.find(
+      (outcome, index) =>
+        index >= 64 &&
+        getAutomaticDeliveryEvidence({ deliveryStatus: { payloadOutcomes: [outcome] } })
+          .mayHaveSent,
+    );
+    if (sendEvidence !== undefined) {
+      retainedPayloadOutcomes[63] = sendEvidence;
+    }
+  }
+  const payloadOutcomes = retainedPayloadOutcomes?.map((record) => {
+    const reason = normalizeOptionalString(record.reason)?.slice(0, 256);
+    const evidence: NonNullable<typeof retainedPayloadOutcomes>[number] = {
+      index: record.index,
+      status: record.status,
+    };
+    if (reason) {
+      evidence.reason = reason;
+    }
+    if (record.sentBeforeError !== undefined) {
+      evidence.sentBeforeError = record.sentBeforeError;
+    }
+    return evidence;
+  });
   const errorMessage = normalizeOptionalString(rawDeliveryStatus?.errorMessage);
+  const reason = normalizeOptionalString(
+    getAutomaticDeliveryEvidence(result).suppressionReason ?? rawDeliveryStatus?.reason,
+  )?.slice(0, 256);
   const deliveryStatus: RestartRecoveryTerminalDeliveryEvidenceResult["deliveryStatus"] = status
     ? {
         status,
-        ...(typeof rawDeliveryStatus?.resultCount === "number" &&
-        Number.isSafeInteger(rawDeliveryStatus.resultCount) &&
-        rawDeliveryStatus.resultCount >= 0
+        ...(rawDeliveryStatus?.resultCount !== undefined
           ? { resultCount: rawDeliveryStatus.resultCount }
           : {}),
         ...(errorMessage ? { errorMessage } : {}),
+        ...(reason ? { reason } : {}),
         ...(payloadOutcomes?.length ? { payloadOutcomes } : {}),
       }
     : undefined;
@@ -277,6 +184,10 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
       : undefined;
   return {
     captured: true,
+    ...(Object.keys(meta).length ? { meta } : {}),
+    ...(result.requesterContinuationSettled === true
+      ? { requesterContinuationSettled: true as const }
+      : {}),
     ...(payloads?.length ? { payloads } : {}),
     ...(payloadsTruncated ? { payloadsTruncated } : {}),
     ...(deliveryStatus ? { deliveryStatus } : {}),
@@ -292,9 +203,49 @@ export function buildRestartRecoveryTerminalDeliveryEvidence(
 export function shouldPersistCurrentRunSessionCleanup(
   current: SessionEntry | undefined,
   sessionId: string,
+  runId: string,
 ): boolean {
+  if (!current || current.sessionId !== sessionId) {
+    return false;
+  }
+  if (current.abortedLastRun !== true) {
+    return true;
+  }
+  // Session Stop is terminal; process shutdown keeps custody. Only the settled
+  // command may retire its source claim after execution and delivery owners leave.
   return (
-    current !== undefined && current.sessionId === sessionId && current.abortedLastRun !== true
+    current.status === "killed" &&
+    current.lastRunId === runId &&
+    current.restartRecoveryDeliveryRunId === runId &&
+    current.lifecycleRunId === undefined &&
+    !current.mainRestartRecovery &&
+    !current.restartRecoveryRuns?.length &&
+    !current.pendingFinalDelivery
+  );
+}
+
+/** A terminal predecessor must not remain the delivery owner of a newly admitted command. */
+export function canReplaceTerminalCommandRecoveryClaim(
+  entry: SessionEntry,
+  runId: string,
+): boolean {
+  const previousRunId = entry.restartRecoveryDeliveryRunId;
+  return Boolean(
+    previousRunId &&
+    previousRunId !== runId &&
+    !entry.pendingFinalDelivery &&
+    !entry.mainRestartRecovery &&
+    !entry.restartRecoveryHarnessCompletion &&
+    !entry.restartRecoveryBeforeAgentReplyState &&
+    !entry.restartRecoveryDeliveryReceiptState &&
+    !entry.restartRecoveryDeliveryToolCallId &&
+    !entry.restartRecoveryRuns?.some(
+      (run) => run.runId !== runId && !hasRestartRecoveryTerminalRun(entry, run.runId),
+    ) &&
+    resolveRestartRecoveryTerminalDeliveryDisposition(entry, {
+      sessionId: entry.sessionId,
+      sourceTurnId: entry.restartRecoveryDeliverySourceRunId ?? previousRunId,
+    }) === "already-delivered",
   );
 }
 
@@ -303,6 +254,7 @@ export function shouldPersistRestartRecoveryContextClaim(
   sessionId: string,
   runId: string,
   allowCreate: boolean,
+  previousEntry: SessionEntry,
 ): boolean {
   if (!current) {
     return allowCreate;
@@ -315,22 +267,28 @@ export function shouldPersistRestartRecoveryContextClaim(
   }
   return (
     current.restartRecoveryDeliveryRunId === undefined ||
-    current.restartRecoveryDeliveryRunId === runId
+    current.restartRecoveryDeliveryRunId === runId ||
+    (canReplaceTerminalCommandRecoveryClaim(previousEntry, runId) &&
+      current.lifecycleRevision === previousEntry.lifecycleRevision &&
+      current.restartRecoveryDeliveryRunId === previousEntry.restartRecoveryDeliveryRunId &&
+      current.restartRecoveryDeliverySourceRunId ===
+        previousEntry.restartRecoveryDeliverySourceRunId &&
+      canReplaceTerminalCommandRecoveryClaim(current, runId))
   );
 }
 
 export function buildCurrentRunRestartRecoveryClaim(params: {
   harnessCompletion?: HarnessCompletionRecovery;
   deliveryContext?: DeliveryContext;
-  deliveryMediaUrls?: string[];
   disableMessageTool?: boolean;
   entry: SessionEntry;
   forceRestartSafeTools?: boolean;
   runId: string;
+  operatorSource?: SessionEntry["restartRecoveryOperatorSource"];
+  requesterSource?: SessionEntry["restartRecoveryRequesterSource"];
   sourceIngress?: SessionEntry["restartRecoverySourceIngress"];
   sourceRunId?: string;
   sourceReplyDeliveryMode?: SessionEntry["restartRecoverySourceReplyDeliveryMode"];
-  suppressTextDelivery?: boolean;
 }): Pick<
   SessionEntry,
   | "restartRecoveryDeliveryContext"
@@ -340,6 +298,8 @@ export function buildCurrentRunRestartRecoveryClaim(params: {
   | "restartRecoveryDeliverySourceRunId"
   | "restartRecoveryHarnessCompletion"
   | "restartRecoveryForceSafeTools"
+  | "restartRecoveryOperatorSource"
+  | "restartRecoveryRequesterSource"
   | "restartRecoverySourceIngress"
   | "restartRecoverySourceReplyDeliveryMode"
   | "restartRecoverySuppressTextDelivery"
@@ -363,6 +323,8 @@ export function buildCurrentRunRestartRecoveryClaim(params: {
       restartRecoverySuppressTextDelivery: entry.restartRecoverySuppressTextDelivery,
       restartRecoveryDeliveryRunId: params.runId,
       restartRecoveryDeliverySourceRunId: entry.restartRecoveryDeliverySourceRunId,
+      restartRecoveryOperatorSource: entry.restartRecoveryOperatorSource,
+      restartRecoveryRequesterSource: entry.restartRecoveryRequesterSource,
       restartRecoverySourceIngress: entry.restartRecoverySourceIngress,
       restartRecoverySourceReplyDeliveryMode: entry.restartRecoverySourceReplyDeliveryMode,
       restartRecoveryForceSafeTools: entry.restartRecoveryForceSafeTools,
@@ -379,16 +341,14 @@ export function buildCurrentRunRestartRecoveryClaim(params: {
         ? { restartRecoveryHarnessCompletion: undefined }
         : {}),
     restartRecoveryDeliveryContext: params.deliveryContext,
-    restartRecoveryDeliveryMediaUrls:
-      createsScopedDeliveryClaim && params.deliveryMediaUrls !== undefined
-        ? [...params.deliveryMediaUrls]
-        : undefined,
+    restartRecoveryDeliveryMediaUrls: undefined,
     restartRecoveryDisableMessageTool:
       createsScopedDeliveryClaim && params.disableMessageTool === true ? true : undefined,
-    restartRecoverySuppressTextDelivery:
-      createsScopedDeliveryClaim && params.suppressTextDelivery === true ? true : undefined,
+    restartRecoverySuppressTextDelivery: undefined,
     restartRecoveryDeliveryRunId: createsScopedDeliveryClaim ? params.runId : undefined,
     restartRecoveryDeliverySourceRunId: params.sourceRunId,
+    restartRecoveryOperatorSource: createsScopedDeliveryClaim ? params.operatorSource : undefined,
+    restartRecoveryRequesterSource: createsScopedDeliveryClaim ? params.requesterSource : undefined,
     restartRecoverySourceIngress: createsScopedDeliveryClaim ? params.sourceIngress : undefined,
     restartRecoverySourceReplyDeliveryMode: params.sourceRunId
       ? params.sourceReplyDeliveryMode
@@ -398,7 +358,7 @@ export function buildCurrentRunRestartRecoveryClaim(params: {
   };
 }
 
-/** Prepare only an admitted channel completion, or the exact saved recovery claim. */
+/** Bind internal completion sources and retain an already-admitted recovery claim. */
 export function prepareCommandHarnessCompletionRecovery(params: {
   entry: SessionEntry;
   sessionId: string;
@@ -418,10 +378,12 @@ export function prepareCommandHarnessCompletionRecovery(params: {
         inputProvenance: opts.inputProvenance,
       })
     : undefined;
-  const generatedMediaSourceRunId =
-    opts.internalDeliveryMediaUrls !== undefined &&
+  const internalCompletionSourceRunId =
     opts.inputProvenance?.kind === "inter_session" &&
-    isAgentMediatedCompletionSourceTool(opts.inputProvenance.sourceTool)
+    opts.inputProvenance.sourceTool === "subagent_settle" &&
+    opts.inputProvenance.sourceChannel === "internal" &&
+    Boolean(opts.inputProvenance.sourceSessionKey?.trim()) &&
+    runId.startsWith("announce:requester-settle:")
       ? runId
       : undefined;
   const claimedHarnessCompletion =
@@ -440,8 +402,8 @@ export function prepareCommandHarnessCompletionRecovery(params: {
       Boolean(current && getOwedHarnessCompletionTask(guardedHarnessCompletion, current)),
     sourceOptions: {
       sourceIngress:
-        generatedMediaSourceRunId || harnessCompletion ? ("internal" as const) : undefined,
-      sourceRunId: generatedMediaSourceRunId ?? harnessCompletion?.sourceRunId,
+        internalCompletionSourceRunId || harnessCompletion ? ("internal" as const) : undefined,
+      sourceRunId: internalCompletionSourceRunId ?? harnessCompletion?.sourceRunId,
       sourceReplyDeliveryMode:
         opts.sourceReplyDeliveryMode ?? (harnessCompletion ? ("automatic" as const) : undefined),
     },
@@ -455,7 +417,7 @@ export function bindCommandHarnessCompletionAssertion(params: {
   sessionKey: string;
   storePath?: string;
   opts: AgentCommandOpts;
-}): AgentCommandOpts {
+}): { opts: AgentCommandOpts } {
   const { claim, persisted, sessionKey, storePath, opts } = params;
   if (
     claim &&
@@ -466,7 +428,7 @@ export function bindCommandHarnessCompletionAssertion(params: {
     throw createSessionWorkStartChangedError(sessionKey);
   }
   if (!claim || !storePath) {
-    return opts;
+    return { opts };
   }
   const guarded = {
     ...opts,
@@ -479,6 +441,5 @@ export function bindCommandHarnessCompletionAssertion(params: {
       { recoveryReference: opts.assertSourceCurrent?.recoveryReference },
     ),
   };
-  guarded.assertSourceCurrent();
-  return guarded;
+  return { opts: guarded };
 }

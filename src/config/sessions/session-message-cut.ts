@@ -1,3 +1,4 @@
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   assertExistingDatabaseIdentity,
   type DatabasePathIdentity,
@@ -9,7 +10,7 @@ import {
   withSqliteSessionContextReset,
 } from "./session-accessor.sqlite-deletion.js";
 import type { retainPreparedSessionSharingFacts } from "./session-accessor.sqlite-entry-cache-publication-state.js";
-import { publishCommittedSessionIdentity } from "./session-accessor.sqlite-identity.js";
+import { createSessionIdentityResultPublisher } from "./session-accessor.sqlite-identity.js";
 import { toDatabaseOptions, type ResolvedSqliteScope } from "./session-accessor.sqlite-scope.js";
 import type { SessionMessageCutMutationParams } from "./session-accessor.types.js";
 import { restoreSessionColdTranscript } from "./session-cold-storage.js";
@@ -20,6 +21,7 @@ import type {
   SessionMessageCutCandidate,
   SessionMessageCutIntent,
   SessionMessageCutResult,
+  SessionMessageCutPreconditions,
 } from "./session-message-cut.types.js";
 import { runSessionNativeBindingWorkerOperation } from "./session-native-binding.js";
 import { startSessionTranscriptIndexReconcile } from "./session-transcript-reconcile.js";
@@ -34,7 +36,7 @@ export async function mutateSessionHistoryInWorker(
     assertCurrent: () => void,
   ) => Promise<SessionMessageCutResult>,
   selection?: ReturnType<typeof retainPreparedSessionSharingFacts>,
-  sourceRepositoryWorkspaceId?: string,
+  preconditions?: SessionMessageCutPreconditions,
 ): Promise<SessionMessageCutResult> {
   params.commitGuard?.();
   if (!source.key.startsWith("file:")) {
@@ -106,6 +108,7 @@ export async function mutateSessionHistoryInWorker(
           resolved,
           { sessionKey: intent.sourceKey, entry: preparedEntry },
           run,
+          preconditions?.assertUpstreamCurrent,
         );
   return prepareContext(async (assertPreparedCurrent) => {
     const assertHeld = () => {
@@ -129,6 +132,18 @@ export async function mutateSessionHistoryInWorker(
       databaseIdentity: source.key.slice("file:".length),
       agentId: resolved.agentId,
       assertCurrent: assertHeld,
+      onTransactionFacts(facts) {
+        if (
+          facts === undefined ||
+          (isRecord(facts) &&
+            (facts.kind === "native-binding-ready" ||
+              (facts.kind === "native-binding-storage" && facts.phase === "delete")))
+        ) {
+          preconditions?.assertUpstreamCurrent?.();
+        }
+        return false;
+      },
+      assertCandidate: () => preconditions?.assertUpstreamCurrent?.(),
       candidateKind: "session-message-cut" as const,
       onAcknowledged(candidate: SessionMessageCutCandidate) {
         if (candidate.result.status === "created") {
@@ -144,18 +159,7 @@ export async function mutateSessionHistoryInWorker(
           ]);
         }
       },
-      onCommitted(candidate, published, identity) {
-        if (published) {
-          publishCommittedSessionIdentity(
-            resolved.agentId,
-            identity,
-            published.previous,
-            published.current,
-            published.prepared,
-          );
-        }
-        return candidate.result;
-      },
+      onCommitted: createSessionIdentityResultPublisher(resolved),
     };
     if (intent.mode === "fork") {
       return runSessionEntryWorkerOperation<SessionMessageCutCandidate, SessionMessageCutResult>({
@@ -167,7 +171,7 @@ export async function mutateSessionHistoryInWorker(
               input: {
                 agentId: resolved.agentId,
                 intent: { ...preparedIntent, mode: "fork" },
-                sourceRepositoryWorkspaceId,
+                sourceRepositoryWorkspaceId: preconditions?.sourceRepositoryWorkspaceId,
               },
             }),
           ),

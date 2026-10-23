@@ -7,6 +7,7 @@ import {
   appendTranscriptMessage,
   applySessionEntryLifecycleMutation,
   listSessionEntriesCore,
+  loadSessionEntry,
   replaceSessionEntry,
 } from "../../config/sessions/session-accessor.js";
 import {
@@ -90,6 +91,18 @@ export function mainSessionEntry(overrides: SessionEntryFixture = {}): SessionEn
   });
 }
 
+export function runningSessionEntry(
+  sessionId: string,
+  overrides: SessionEntryFixture = {},
+): SessionEntry {
+  return createSessionEntry({
+    sessionId,
+    updatedAt: Date.now() - 10_000,
+    restartRecoveryDeliveryRunId: `${sessionId}-run`,
+    ...overrides,
+  });
+}
+
 export function makePendingFinalDelivery(
   text = "interrupted response",
   overrides: Partial<NonNullable<SessionEntry["pendingFinalDelivery"]>> = {},
@@ -137,6 +150,29 @@ export function createRestartRecoveryStoreFixture(getStateDir: () => string) {
     await writeStorePath(path.join(sessionsDir, "sessions.json"), store);
   }
 
+  async function writeMainSession({
+    sessionsDir,
+    sessionKey = "agent:main:main",
+    ...entry
+  }: SessionEntryFixture & { sessionsDir: string; sessionKey?: string }): Promise<void> {
+    await writeStore(sessionsDir, { [sessionKey]: mainSessionEntry(entry) });
+  }
+
+  async function makeMainSessionFixture(
+    overrides: SessionEntryFixture & { agentId?: string; sessionKey?: string } = {},
+  ) {
+    const { agentId = "main", sessionKey = "agent:main:main", ...entry } = overrides;
+    const sessionsDir = await makeSessionsDir(agentId);
+    await writeMainSession({ sessionsDir, sessionKey, ...entry });
+    const storePath = path.join(sessionsDir, "sessions.json");
+    return {
+      sessionsDir,
+      storePath,
+      sessionKey,
+      readEntry: () => loadSessionEntry({ sessionKey, storePath }),
+    };
+  }
+
   async function writeCompletedToolTranscript(sessionsDir: string, human = false): Promise<void> {
     await writeTranscript(sessionsDir, "main-session", [
       makeUserMessage("run the tool", human ? { provenance: { kind: "external_user" } } : {}),
@@ -149,6 +185,8 @@ export function createRestartRecoveryStoreFixture(getStateDir: () => string) {
     makeSessionsDir,
     writeStorePath,
     writeStore,
+    writeMainSession,
+    makeMainSessionFixture,
     transcriptFixture,
     writeTranscript,
     writeCompletedToolTranscript,
