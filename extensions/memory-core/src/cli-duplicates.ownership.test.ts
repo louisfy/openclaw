@@ -4,13 +4,13 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Command } from "commander";
 import { afterEach, expect, it, vi } from "vitest";
-import { registerMemoryCli } from "../../extensions/memory-core/runtime-api.js";
-import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import { resetConfigRuntimeState } from "../config/config.js";
-import type { OpenClawConfig } from "../config/types.js";
-import * as secretResolution from "../gateway/resolve-configured-secret-input-string.js";
-import { resolveNodeRuntimeExecutable } from "../infra/node-runtime-executable.js";
-import { defaultRuntime } from "../runtime.js";
+import { resetConfigRuntimeState } from "../../../src/config/config.js";
+import type { OpenClawConfig } from "../../../src/config/types.js";
+import * as secretResolution from "../../../src/gateway/resolve-configured-secret-input-string.js";
+import { resolveNodeRuntimeExecutable } from "../../../src/infra/node-runtime-executable.js";
+import { defaultRuntime } from "../../../src/runtime.js";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
+import { registerMemoryCli } from "../runtime-api.js";
 
 const roots = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => {
