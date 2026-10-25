@@ -62,6 +62,7 @@ beforeAll(() => {
 });
 
 beforeEach(async () => {
+  vi.stubEnv("OPENCLAW_STATE_DIR", baseDir);
   await withDevicePairingLock(async () => {});
   const now = Date.now();
   const state: DevicePairingStoreState = {
@@ -241,7 +242,6 @@ test("reconnects without replacing paired rows or changing unrelated device fiel
     deviceId: "paired-rich",
     role: "operator",
     scopes: ["operator.read"],
-    baseDir,
   });
   database.db.exec(`
     CREATE TRIGGER pairing_reconnect_no_delete BEFORE DELETE ON device_pairing_paired
@@ -285,7 +285,6 @@ test("reconnects without replacing paired rows or changing unrelated device fiel
         deviceId: "paired-rich",
         role: "operator",
         scopes: ["operator.read"],
-        baseDir,
       }),
     ).resolves.toEqual(verified?.tokens?.operator);
     const after = readDevicePairingStoreStateFromDatabase(database.db);
@@ -331,7 +330,6 @@ test("reconnect receipts ignore pending rows and leave sibling pairing changes t
       deviceId: "paired-rich",
       role: "operator",
       scopes: ["operator.read"],
-      baseDir,
     };
     await expect(
       verifyDeviceToken({ ...tokenParams, token: "synthetic-operator-token" }),
@@ -651,7 +649,7 @@ test("reuses and verifies committed tokens while writes wait, then rejects commi
   signal,
 }) => {
   await listDevicePairing(baseDir);
-  const params = { deviceId: "paired-rich", role: "operator", scopes: ["operator.read"], baseDir };
+  const params = { deviceId: "paired-rich", role: "operator", scopes: ["operator.read"] };
   const entered = createDeferredCore();
   const release = createDeferredCore();
   const holding = withDevicePairingLock(async () => {
@@ -691,6 +689,29 @@ test("reuses and verifies committed tokens while writes wait, then rejects commi
   await expect(
     verifyDeviceToken({ ...params, token: "synthetic-operator-token" }),
   ).resolves.toEqual({ ok: false, reason: "token-revoked" });
+});
+
+test("keeps queued token rotation before revocation in the pairing owner", async () => {
+  const params = { deviceId: "paired-rich", role: "operator", baseDir };
+  const entered = createDeferredCore();
+  const release = createDeferredCore();
+  const holding = withDevicePairingLock(async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  await entered.promise;
+  const rotating = rotateDeviceToken(params);
+  const revoking = revokeDeviceToken(params);
+  release.resolve();
+  const [, rotated, revoked] = await Promise.all([holding, rotating, revoking]);
+  expect(rotated.ok).toBe(true);
+  expect(revoked.ok).toBe(true);
+  if (rotated.ok && revoked.ok) {
+    expect(revoked.entry.token).toBe(rotated.entry.token);
+    await expect(
+      verifyDeviceToken({ ...params, token: rotated.entry.token, scopes: [] }),
+    ).resolves.toEqual({ ok: false, reason: "token-revoked" });
+  }
 });
 
 test("admits revocation between coalesced token last-use writes", async ({ signal }) => {

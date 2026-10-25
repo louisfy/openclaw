@@ -106,7 +106,7 @@ export abstract class ChatPaneSessionMenu extends ChatPaneContext {
     if (
       event.repeat ||
       event.defaultPrevented ||
-      !state?.connected ||
+      !state ||
       !this.active ||
       !this.presented ||
       this.onboarding ||
@@ -276,6 +276,8 @@ export abstract class ChatPaneSessionMenu extends ChatPaneContext {
         action.kind === "set-icon" ||
         action.kind === "set-color" ||
         action.kind === "reset-appearance" ||
+        action.kind === "toggle-archived" ||
+        action.kind === "delete" ||
         action.kind === "move-to-group",
     );
     if (!scope) {
@@ -315,14 +317,9 @@ export abstract class ChatPaneSessionMenu extends ChatPaneContext {
         selectSession: (key) => this.onPaneSessionChange?.(this.paneId, key),
       });
       const assignCategory = (category: string | null) =>
-        operations.assignSessionCategory(
-          host,
-          session,
-          category,
-          scope,
-          {},
-          { resolveSession: resolveCurrentSession },
-        );
+        operations.assignSessionCategory(host, session, category, scope, {
+          resolveSession: resolveCurrentSession,
+        });
       switch (action.kind) {
         case "rename": {
           const state = this.state;

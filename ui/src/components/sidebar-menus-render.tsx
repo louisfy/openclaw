@@ -32,8 +32,8 @@ import {
   runControlUiPluginAction,
 } from "../plugins/control-ui-actions.ts";
 import { renderSidebarAgentMenu as SidebarAgentMenu } from "./app-sidebar-agent-menu.tsx";
+import { SidebarDropdown, renderSidebarMenuAction } from "./app-sidebar-dropdown.tsx";
 import { renderSidebarIdentityMenu as SidebarIdentityMenu } from "./app-sidebar-identity-menu.tsx";
-import { SidebarDropdown, renderSidebarMenuAction } from "./app-sidebar-nav-menus.tsx";
 import { renderSidebarPeopleFilterMenuForMenus } from "./app-sidebar-people-filter-menu.tsx";
 import { renderSidebarPluginNavigationMenuForMenus } from "./app-sidebar-plugin-navigation-menu.tsx";
 import { formatSidebarTimestamp } from "./app-sidebar-session-catalogs.ts";
@@ -126,7 +126,7 @@ function renderSidebarMenus(
   ];
 }
 
-export function renderSidebarRailPinMenuForMenus(
+function renderSidebarRailPinMenuForMenus(
   menus: SidebarMenus,
   host: SidebarMenusOwner,
   position: NonNullable<SidebarMenus["railPinMenuPosition"]>,
@@ -177,7 +177,7 @@ export function renderSidebarRailPinMenuForMenus(
   );
 }
 
-export function renderSidebarAgentMenuForMenus(
+function renderSidebarAgentMenuForMenus(
   menus: SidebarMenus,
   host: SidebarMenusOwner,
   position: NonNullable<SidebarMenus["agentMenuPosition"]>,
@@ -264,7 +264,7 @@ export function renderSidebarAgentMenuForMenus(
   );
 }
 
-export function renderSidebarAgentCreateDialogForMenus(
+function renderSidebarAgentCreateDialogForMenus(
   menus: SidebarMenus,
   host: SidebarMenusOwner,
 ): JSX.Element | null {
@@ -345,7 +345,7 @@ function renderSidebarIdentityMenuForMenus(
   );
 }
 
-export function renderSidebarSessionMenuForMenus(
+function renderSidebarSessionMenuForMenus(
   menus: SidebarMenus,
   host: SidebarMenusOwner,
   menu: NonNullable<SidebarMenus["sessionMenu"]>,
