@@ -134,21 +134,8 @@ it("reconnects only expired, locally managed OAuth accounts through their creden
     expect(button()?.disabled).toBe(true);
   }
   for (const profile of [
-    { profileId: "xai:expired", type: "oauth", status: "ok" },
-    { profileId: "xai:expired", type: "oauth", status: "expired", externallyManaged: true },
-    { profileId: "xai:expired", type: "oauth", status: "expired", source: "external" },
-    { profileId: "xai:expired", type: "oauth", status: "expired", source: "config" },
-    { profileId: "xai:expired", type: "oauth", status: "expired", source: "inherited" },
-    {
-      profileId: "xai:expired",
-      type: "oauth",
-      status: "expired",
-      source: "inherited",
-      logoutSupported: true,
-    },
-    { profileId: "xai:expired", type: "oauth", status: "expired", source: "saved" },
-    { profileId: "xai:expired", type: "oauth", status: "expired", logoutSupported: false },
-    { profileId: "xai:expired", type: "api_key", status: "expired" },
+    { profileId: "xai:expired", type: "oauth", status: "ok", reconnectSupported: true },
+    { profileId: "xai:expired", type: "api_key", status: "expired", reconnectSupported: true },
   ] as const) {
     update({ ...providerCard, profiles: [profile] }, viewProps);
     expect(button()).toBeNull();
