@@ -49,12 +49,12 @@ allowlist mode instead.
         "enabled": true,
         "llm": {
           "allowModelOverride": true,
-          "allowedCompletionModels": ["openai/gpt-6-astra"],
+          "allowedCompletionModels": ["openai/gpt-5.6-sol"],
           "allowAuthProfileOverride": true
         },
         "config": {
           "defaultProvider": "openai",
-          "defaultModel": "gpt-6-astra",
+          "defaultModel": "gpt-5.6-sol",
           "defaultAuthProfileId": "main",
           "maxTokens": 800,
           "timeoutMs": 30000
@@ -82,7 +82,7 @@ legacy `config.allowedModels` value into `llm.allowedCompletionModels` without w
 | `prompt`        | string | Required. Task instruction for the LLM.                                                                                                       |
 | `input`         | any    | Optional payload; serialized to JSON and appended to the prompt.                                                                              |
 | `batch`         | object | Optional independent inputs and concurrency; mutually exclusive with `input`. See [Batch tasks](#batch-tasks).                                |
-| `schema`        | object | Optional JSON Schema the parsed output must validate against.                                                                                 |
+| `schema`        | object | Optional JSON Schema that constrains supported runtimes and validates the parsed output.                                                      |
 | `provider`      | string | Overrides `defaultProvider` / the agent's default provider.                                                                                   |
 | `model`         | string | Overrides `defaultModel`; accepts bare model ids, aliases, or a `provider/model` ref (a duplicate provider prefix is stripped automatically). |
 | `thinking`      | string | Reasoning level (e.g. `low`, `medium`); must be one supported by the resolved model.                                                          |
@@ -99,8 +99,10 @@ and `details.model` naming what actually ran.
 Each input starts a fresh prompt-only inference operation. It does not reuse the
 calling agent's transcript or native runtime session, run agent lifecycle hooks,
 or deliver model output to a channel. OpenClaw uses the selected provider,
-model, auth profile, and runtime once per input; it does not fall back to another
+model, auth profile, and runtime for each input without falling back to another
 route when that owner cannot provide isolated completion.
+A native-schema rejection may cause one prompt-constrained retry on that same
+route before local validation.
 
 Agents API runs restricted sessions by default, without an executor or supplied
 tools, but its service may retain built-in helpers. It cannot guarantee literal
@@ -111,6 +113,15 @@ A selected agent harness must implement isolated completion. Otherwise the call
 fails before inference with a `does not support isolated completion` error.
 Rejecting the call prevents a JSON task from silently becoming a normal
 tool-capable agent turn.
+
+When the selected harness supports native structured output, OpenClaw forwards
+the schema by reference when its JSON encoding fits within 1 KiB. Callers must
+not mutate it after handoff. Larger or non-serializable schemas are not
+forwarded natively. If Codex explicitly rejects the
+schema dialect, OpenClaw retries the isolated turn once with a user-level schema
+constraint. `llm-task` always validates the parsed result, and the
+retry remains a fresh zero-tool turn rather than a normal tool-capable agent
+turn.
 
 CLI runtimes must provide the equivalent isolated preparation guarantee. The
 bundled Claude and Gemini CLI runtimes do; a different CLI runtime that has not
@@ -154,9 +165,10 @@ Batch API and not an agent workflow engine.
   existing host-authorized isolated-completion path; there is no provider fallback.
 - `timeoutMs` covers the entire batch, including waiting for a slot. Cancellation
   or timeout stops new inference and signals in-flight requests.
-- There is no automatic retry. Each started input can consume a separate model
-  request; `maxTokens` is per item, not a total spending limit. Cancelled requests
-  may already have incurred usage.
+- The batch scheduler does not retry items. The isolated runtime may perform
+  its documented native-schema fallback retry on the same route. Each started
+  input can consume model requests; `maxTokens` is per item, not a total spending
+  limit. Cancelled requests may already have incurred usage.
 
 `details.json` contains `status` (`completed`, `cancelled`, or `timed_out`) and
 `results` in input order. **`completed` means all items settled, not all succeeded.**

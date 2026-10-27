@@ -1,26 +1,30 @@
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
-import path from "node:path";
 import { asRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { GatewayClient } from "../src/gateway/client.js";
 import { buildMockOpenAiResponsesProvider } from "../src/gateway/test-openai-responses-model.js";
 import { createWorkerEnvironmentStore } from "../src/gateway/worker-environments/store.js";
-import { loadOrCreateDeviceIdentity } from "../src/infra/device-identity.js";
 import { writeGatewayRestartIntentSync } from "../src/infra/restart-intent.js";
+import { extractFirstTextBlock } from "../src/shared/chat-message-content.js";
 import {
   closeOpenClawStateDatabaseByPathAsync,
   openOpenClawStateDatabase,
 } from "../src/state/openclaw-state-db.js";
 import { reserveTestPortListener } from "../src/test-utils/port-claims.js";
-import { acquireGatewayTestClient } from "./helpers/gateway-client.js";
-import { GATEWAY_RESTART_TEST_KILL_MS } from "./helpers/gateway-restart-budget.js";
 import {
-  writeOpenAiResponsesSse,
-  writeOpenAiResponsesText,
-} from "./helpers/openai-responses-sse.js";
+  connectRestartClient,
+  restartEnv,
+  restartModelConfig,
+  restartToolNames,
+  writeRestartPlugin,
+  writeRestartTitle,
+  writeRestartToolCall,
+} from "./gateway-restart.test-support.js";
+import { readRequestText } from "./helpers/gateway-integration-fixtures.js";
+import { GATEWAY_RESTART_TEST_KILL_MS } from "./helpers/gateway-restart-budget.js";
+import { writeOpenAiResponsesText } from "./helpers/openai-responses-sse.js";
 import { createOpenClawTestInstance } from "./helpers/openclaw-test-instance.js";
 import { createDeferred, withinTest } from "./helpers/promise.js";
 import { runQaGatewayFixture } from "./helpers/qa-gateway-cleanup.js";
@@ -28,6 +32,17 @@ import { runQaGatewayFixture } from "./helpers/qa-gateway-cleanup.js";
 const key = (name: string) => `agent:main:shutdown-settlement-${name}`;
 const marker = (name: string) => `SHUTDOWN_SETTLEMENT_${name}`;
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+function historyToolOutput(messages: unknown[], name: string): unknown {
+  const result = messages
+    .flatMap((message) => {
+      const entry = asRecord(message);
+      return entry.role === "custom" && Array.isArray(entry.content) ? entry.content : [entry];
+    })
+    .find((entry) => isRecord(entry) && entry.role === "toolResult" && entry.toolName === name);
+  expect(result).toBeDefined();
+  return JSON.parse(extractFirstTextBlock(result) ?? "null");
+}
 
 function childProcessDiagnostic(pid: number) {
   const read = (name: "stat" | "status") => {
@@ -49,44 +64,28 @@ function toolCall(
 ) {
   const tool = tools.includes(name) ? name : "dispatch_action";
   expect(tools).toContain(tool);
-  const item = {
-    type: "function_call",
-    id: `fc_settlement_${ordinal}`,
-    call_id: `call_settlement_${ordinal}`,
-    name: tool,
-    arguments: JSON.stringify(tool === "dispatch_action" ? { id: name, args } : args),
-  };
-  writeOpenAiResponsesSse(response, [
-    { type: "response.output_item.added", output_index: 0, item: { ...item, arguments: "" } },
-    {
-      type: "response.function_call_arguments.delta",
-      output_index: 0,
-      item_id: item.id,
-      delta: item.arguments,
-    },
-    { type: "response.output_item.done", output_index: 0, item },
-    {
-      type: "response.completed",
-      response: {
-        id: `resp_settlement_${ordinal}`,
-        status: "completed",
-        output: [item],
-        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-      },
-    },
-  ]);
+  writeRestartToolCall(
+    response,
+    "settlement",
+    tool,
+    tool === "dispatch_action" ? { id: name, args } : args,
+    ordinal,
+  );
 }
 
 it(
-  "settles recovered provisioning and restart-aborted nested/subagent turns with a Git child",
+  "settles recovered provisioning and restart-aborted nested/subagent lifecycle turns with a Git child",
   { timeout: 180_000 },
   async ({ signal }) => {
+    const plainTurns = ["plain-1", "plain-2", "plain-3", "plain-4", "plain-5", "plain-6"];
     const ready = new Map(
-      ["spawn", "child", "nested", "exec", "plain", "provision"].map((name) => [
+      ["spawn", "child", "send", "nested", "exec", ...plainTurns, "provision"].map((name) => [
         name,
         createDeferred(),
       ]),
     );
+    const wakeChild = createDeferred<ServerResponse>();
+    const wakePending = createDeferred();
     const gitStarted = createDeferred<{ pid: number; gitPid: number }>();
     const failed = createDeferred<never>();
     void failed.promise.catch(() => {});
@@ -103,11 +102,7 @@ it(
               ready.get("provision")!.resolve();
               return;
             }
-            const chunks: Buffer[] = [];
-            for await (const chunk of request) {
-              chunks.push(Buffer.from(chunk));
-            }
-            const body = asRecord(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+            const body = asRecord(JSON.parse(await readRequestText(request)));
             if (request.url === "/git-started") {
               expect(body.pid).toBeTypeOf("number");
               expect(body.gitPid).toBeTypeOf("number");
@@ -115,37 +110,10 @@ it(
               return;
             }
             expect(request.url).toBe("/v1/responses");
-            const tools = Array.isArray(body.tools)
-              ? body.tools.flatMap((tool) =>
-                  isRecord(tool) && typeof tool.name === "string" ? [tool.name] : [],
-                )
-              : [];
+            const tools = restartToolNames(body);
             if (!tools.length) {
               if (body.stream === false) {
-                response.writeHead(200, { "content-type": "application/json" });
-                response.end(
-                  JSON.stringify({
-                    id: "resp_title",
-                    object: "response",
-                    status: "completed",
-                    output: [
-                      {
-                        type: "message",
-                        id: "msg_title",
-                        role: "assistant",
-                        status: "completed",
-                        content: [
-                          {
-                            type: "output_text",
-                            text: "Synthetic restart settlement",
-                            annotations: [],
-                          },
-                        ],
-                      },
-                    ],
-                    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
-                  }),
-                );
+                writeRestartTitle(response, "Synthetic restart settlement");
                 return;
               }
               writeOpenAiResponsesText(response, {
@@ -157,8 +125,10 @@ it(
             }
             const input = JSON.stringify(body.input);
             const name = input.includes("You are running as a subagent")
-              ? "child"
-              : ["spawn", "send", "nested", "exec", "plain"].find((candidate) =>
+              ? input.includes(marker("wake-child"))
+                ? "wake-child"
+                : "child"
+              : ["spawn", "send", "nested", "exec", ...plainTurns, "wake"].find((candidate) =>
                   input.includes(marker(candidate)),
                 );
             if (!name) {
@@ -167,28 +137,41 @@ it(
             const count = (calls.get(name) ?? 0) + 1;
             calls.set(name, count);
             ordinal++;
-            if (name === "spawn" && count === 1) {
+            if ((name === "spawn" || name === "wake") && count === 1) {
               toolCall(
                 response,
                 tools,
                 "sessions_spawn",
                 {
-                  taskName: "shutdown_child",
-                  task: marker("child"),
+                  taskName: `shutdown_${name}_child`,
+                  task: marker(name === "wake" ? "wake-child" : "child"),
                   context: "isolated",
                   cleanup: "keep",
-                  expectsCompletionMessage: false,
+                  expectsCompletionMessage: name === "wake",
                 },
                 ordinal,
               );
               return;
+            }
+            if (name === "wake-child") {
+              wakeChild.resolve(response);
+              return;
+            }
+            if (name === "wake") {
+              if (count === 2) {
+                toolCall(response, tools, "sessions_yield", {}, ordinal);
+                return;
+              }
+              expect(count).toBe(3);
+              expect(input).toContain(marker("wake-done"));
+              wakePending.resolve();
             }
             if (name === "send" && count === 1) {
               toolCall(
                 response,
                 tools,
                 "sessions_send",
-                { sessionKey: key("nested"), message: marker("nested"), timeoutSeconds: 120 },
+                { sessionKey: key("nested"), message: marker("nested"), timeoutSeconds: 0 },
                 ordinal,
               );
               return;
@@ -237,11 +220,7 @@ it(
       stopTimeoutMs: 10_000,
       gracefulShutdownTimeoutMs: GATEWAY_RESTART_TEST_KILL_MS,
       env: {
-        OPENAI_API_KEY: undefined,
-        OPENAI_BASE_URL: undefined,
-        OPENAI_API_BASE: undefined,
-        OPENCLAW_SKIP_PROVIDERS: undefined,
-        OPENCLAW_TEST_MINIMAL_GATEWAY: undefined,
+        ...restartEnv,
         OPENCLAW_NO_RESPAWN: "1",
       },
     });
@@ -253,18 +232,14 @@ it(
         try {
           const pluginId = "shutdown-provision";
           const pluginDir = instance.state.path("provision-plugin");
-          await mkdir(pluginDir, { recursive: true });
-          await writeFile(
-            path.join(pluginDir, "openclaw.plugin.json"),
-            JSON.stringify({
+          await writeRestartPlugin(
+            pluginDir,
+            {
               id: pluginId,
               activation: { onStartup: true },
               contracts: { workerProviders: [pluginId] },
               configSchema: { type: "object", additionalProperties: false, properties: {} },
-            }),
-          );
-          await writeFile(
-            path.join(pluginDir, "index.mjs"),
+            },
             `export default {
               id: ${JSON.stringify(pluginId)},
               register(api) {
@@ -298,34 +273,14 @@ it(
               slots: { memory: "none" },
             },
             cloudWorkers: { profiles: { shutdown: { provider: pluginId, settings: {} } } },
-            models: {
-              catalogRefresh: { enabled: false },
-              mode: "replace",
-              providers: {
-                [model.providerId]: { ...model.config, request: { allowPrivateNetwork: true } },
-              },
-            },
-            agents: {
-              defaults: {
-                workspace: instance.state.workspaceDir,
-                model: { primary: model.modelRef },
-                modelPolicy: { allow: [model.modelRef] },
-                models: {
-                  [model.modelRef]: {
-                    agentRuntime: { id: "openclaw" },
-                    params: { transport: "sse", openaiWsWarmup: false },
-                  },
-                },
-                heartbeat: { every: "0m" },
-                maxConcurrent: 8,
-                timeoutSeconds: 120,
-                skipBootstrap: true,
-                skills: [],
-              },
-              entries: { main: {} },
-            },
+            ...restartModelConfig(
+              model,
+              instance.state.workspaceDir,
+              { maxConcurrent: 16 },
+              { catalogRefresh: { enabled: false } },
+            ),
             tools: {
-              allow: ["exec", "process", "sessions_spawn", "sessions_send"],
+              allow: ["exec", "process", "sessions_spawn", "sessions_yield", "sessions_send"],
               exec: { mode: "full", host: "gateway" },
               codeMode: { enabled: false },
               sessions: { visibility: "all" },
@@ -359,25 +314,8 @@ it(
           }
           phase = "start";
           await instance.startGateway();
-          client = await acquireGatewayTestClient(
-            {
-              url: instance.url,
-              token: instance.gatewayToken,
-              clientName: "gateway-client",
-              mode: "test",
-              scopes: ["operator.admin", "operator.read", "operator.write"],
-              deviceIdentity: loadOrCreateDeviceIdentity({
-                path: instance.state.path("device.sqlite"),
-              }),
-            },
-            {
-              signal,
-              timeoutMs: 30_000,
-              timeoutMessage: "restart settlement client did not connect",
-              closeMessage: "restart settlement client closed",
-            },
-          );
-          for (const name of ["nested", "spawn", "send", "exec", "plain"]) {
+          client = await connectRestartClient(instance, { mode: "test" }, signal);
+          for (const name of ["nested", "spawn", "send", "exec", ...plainTurns, "wake"]) {
             await client.request("sessions.create", {
               key: key(name),
               agentId: "main",
@@ -386,7 +324,7 @@ it(
             });
           }
           phase = "admit";
-          for (const name of ["spawn", "send", "exec", "plain"]) {
+          for (const name of ["spawn", "send", "exec", ...plainTurns, "wake"]) {
             await client.request(
               "agent",
               {
@@ -403,6 +341,36 @@ it(
           phase = "wait-active";
           await gate(Promise.all([...ready.values()].map((deferred) => deferred.promise)));
           const childPids = await gate(gitStarted.promise);
+          const senderHistory = await client.request<{ messages: unknown[] }>("chat.history", {
+            sessionKey: key("send"),
+          });
+          expect(historyToolOutput(senderHistory.messages, "sessions_send")).toMatchObject({
+            status: "accepted",
+            targetDisposition: "queued",
+            delivery: { status: "pending" },
+          });
+          const wakeResponse = await gate(wakeChild.promise);
+          const observer = client;
+          await gate(
+            vi.waitFor(
+              async () => {
+                const history = await observer.request<{ messages: unknown[] }>("chat.history", {
+                  sessionKey: key("wake"),
+                });
+                expect(historyToolOutput(history.messages, "sessions_yield")).toMatchObject({
+                  status: "yielded",
+                });
+              },
+              { timeout: 30_000 },
+            ),
+          );
+          // Complete only after the parent yielded; its next model request is a lifecycle wake.
+          writeOpenAiResponsesText(wakeResponse, {
+            text: marker("wake-done"),
+            messageId: "msg_wake_child_done",
+            responseId: "resp_wake_child_done",
+          });
+          await gate(wakePending.promise);
           phase = "restart";
           await client.stopAndWait();
           client = undefined;
@@ -415,12 +383,17 @@ it(
               intent: { reason: "gateway.restart", force: true, waitMs: 100 },
             }),
           ).toBe(true);
+          const shutdownStartedAt = Date.now();
           expect(child.kill("SIGTERM")).toBe(true);
           expect(await gate(closed), instance.logs()).toEqual([0, null]);
+          expect(Date.now() - shutdownStartedAt, instance.logs()).toBeLessThan(5_000);
           expect(instance.logs()).toMatch(
             /completed in \d+ms with warnings: restart-reply-drain\b/u,
           );
           expect(instance.logs()).not.toContain("shutdown deadline reached");
+          expect(instance.logs()).not.toContain(
+            "In-process gateway dispatch requires a current gateway instance binding",
+          );
           for (const pid of [childPids.pid, childPids.gitPid]) {
             try {
               expect(() => process.kill(pid, 0)).toThrow();

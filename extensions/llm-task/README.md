@@ -94,10 +94,17 @@ Batch calls return `details.json = { status, results }`. Results retain input
 order and have an `id` plus `status`: `ok` (with `json`, `provider`, `model`),
 `error` (with a stable error category), `cancelled`, or `not_started`.
 The batch status `completed` does not mean every item succeeded. Successful
-items are retained when siblings fail. No item is automatically retried;
+items are retained when siblings fail. The batch scheduler does not retry items;
 resubmit selected unsuccessful inputs explicitly. There is no durable batch
 store, and cancelled in-flight requests may already have consumed model usage.
 See the [batch task reference](https://docs.openclaw.ai/tools/llm-task#batch-tasks).
+
+When the selected isolated runtime supports native structured output, the same
+schema also constrains generation. Codex retries with a prompt-level constraint
+when it explicitly rejects the schema dialect; local validation remains the
+final result check. OpenClaw forwards the schema by reference when its JSON
+encoding fits within 1 KiB; other schemas are not forwarded natively. Callers
+must not mutate the schema after handoff.
 
 ## Notes
 

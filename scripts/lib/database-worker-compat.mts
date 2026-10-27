@@ -1,6 +1,7 @@
 import path from "node:path";
-import * as ts from "typescript/unstable/ast";
-import { SymbolFlags, type Symbol } from "typescript/unstable/sync";
+import * as ts from "typescript/ast";
+import { serverFS } from "typescript/fs";
+import { SymbolFlags, type Symbol } from "typescript/sync";
 import { createNativeTypeScriptProject } from "./native-typescript.mts";
 import { inspectPersonalCredentialWriters } from "./personal-credential-writer-guard.mts";
 
@@ -112,8 +113,26 @@ const reviewed = new Map<string, readonly string[]>([
 // Mixed SDK receivers retain only these deprecated members, never their live factories.
 const reviewedMembers = new Map<string, readonly string[]>([
   [
+    "src/gateway/github-oauth-lifecycle.ts",
+    ["createGitHubOAuthLifecycle.cancelAuthorization", "createGitHubOAuthLifecycle.retireProfile"],
+  ],
+  [
+    "src/gateway/github-personal-oauth.ts",
+    [
+      "createPersonalGitHubOAuthLifecycle.cancelAuthorization",
+      "createPersonalGitHubOAuthLifecycle.disconnect",
+    ],
+  ],
+  [
     "src/agents/sessions/session-manager.ts",
-    ["open", "openBounded", "openDetachedBounded", "openModelContext", "readSessionContext"],
+    [
+      "open",
+      "openBounded",
+      "openDetachedBounded",
+      "openModelContext",
+      "readSessionContext",
+      "prepareTranscriptRewrite",
+    ],
   ],
   [
     "src/agents/sessions/session-manager-core.ts",
@@ -163,6 +182,18 @@ const reviewedMembers = new Map<string, readonly string[]>([
 // These are candidates, not exemptions: every value reference must resolve to
 // another proven candidate or an inventory-reviewed worker/maintenance entry.
 const nonRuntimeCandidates = new Map<string, readonly string[]>([
+  [
+    "src/config/sessions/session-cold-storage-chunks.ts",
+    ["readSessionColdChunks", "iterateSessionColdRecords"],
+  ],
+  [
+    "src/config/sessions/session-cold-storage-prepare.ts",
+    [
+      "prepareSessionColdArchiveInWorker",
+      "prepareSessionColdBatchInWorker",
+      "prepareExternalization",
+    ],
+  ],
   ["src/state/openclaw-state-db-maintenance.ts", ["writeCurrentStateSchemaMetadata"]],
   ["src/state/user-profile-mutation.ts", ["runUserProfileWriteTransaction"]],
   ["src/gateway/channel-operator-authority.ts", ["resolveChannelOperatorIdentityFacts"]],
@@ -269,6 +300,7 @@ const synchronousScopes = new Map<string, ReadonlyMap<string, number>>([
     "src/state/openclaw-state-db-readonly.ts",
     new Map([["withExistingOpenClawStateDatabaseReadOnly", 0]]),
   ],
+  ["src/state/openclaw-agent-db-readonly.ts", new Map([["withOpenClawAgentDatabaseReadOnly", 0]])],
   ["src/state/openclaw-state-db.ts", new Map([["runOpenClawStateWriteTransaction", 0]])],
   ["src/state/user-profile-mutation.ts", new Map([["runUserProfileWriteTransaction", 0]])],
   ["src/state/user-profiles-internal.ts", new Map([["readResolvedUserProfile", 1]])],
@@ -369,11 +401,14 @@ export function inspectDatabaseWorkerBoundaries(
     configFileName: config,
     files,
     fs: {
-      readFile: () => null,
+      readFile: () => undefined,
       fileExists: () => false,
       directoryExists: () => false,
-      getAccessibleEntries: () => ({ files: [], directories: [] }),
-      realpath: (file) => file,
+      getAccessibleEntries: () => ({ files: [], directories: [], symlinks: undefined }),
+      realpath: serverFS.identity,
+      stat: serverFS.fakeStat,
+      writeFile: serverFS.error,
+      removeFile: serverFS.error,
     },
   });
   const { checker, program } = session.project;

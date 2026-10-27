@@ -213,6 +213,11 @@ export async function runSqliteSessionsTranscriptsFlipProof(options: RunOptions 
         await record("after-doctor-fix", fixDoctor);
         scaleMigration = requireScaleMigrationProof(context, Date.now() - doctorImportStartedAt);
 
+        // The drill owns a separate store; finish stopped-writer maintenance before
+        // one Gateway serves live inspection and the session lifecycle below.
+        rollbackRestore = await runRollbackRestoreProof(inst, context);
+        await record("after-rollback-restore");
+
         await inst.startGateway();
         await record("after-gateway-start");
 
@@ -222,23 +227,8 @@ export async function runSqliteSessionsTranscriptsFlipProof(options: RunOptions 
         const validateDoctor = await runDoctor(inst, "validate", context.storePath);
         await record("after-doctor-validate", validateDoctor);
 
-        const { client, disconnect } = await connectProofClient(
-          inst,
-          context,
-          "sqlite-sessions-transcripts-flip-proof",
-        );
-        await waitForHistoryContains(client, context.resetSessionKey, "legacy hello");
-        await disconnect();
-
-        await inst.stopGateway();
-        // Destructive Doctor maintenance owns the stopped Gateway epoch; inspect/validate stay live.
-        rollbackRestore = await runRollbackRestoreProof(inst, context);
-        await record("after-rollback-restore");
-        await inst.startGateway();
-        await record("after-gateway-restart");
-
         let { client: restartedClient, disconnect: disconnectRestartedClient } =
-          await connectProofClient(inst, context, "sqlite-sessions-transcripts-flip-proof-restart");
+          await connectProofClient(inst, context, "sqlite-sessions-transcripts-flip-proof");
         await waitForHistoryContains(restartedClient, context.resetSessionKey, "legacy hello");
         const resetPreludeRunId = await sendGatewayUserMessage(
           restartedClient,
@@ -1705,19 +1695,18 @@ async function sendGatewayUserMessage(
   sessionKey: string,
   message: string,
 ): Promise<string> {
-  const result: { runId?: string; status?: string } = await client.request(
-    "chat.send",
-    {
-      sessionKey,
-      message,
-      idempotencyKey: `sqlite-send-${randomUUID()}`,
-    },
-    { timeoutMs: SQLITE_FLIP_PROOF_OPERATION_TIMEOUT_MS },
-  );
-  if (result?.status !== "started" || typeof result.runId !== "string") {
-    throw new Error(`chat.send did not start correctly: ${JSON.stringify(result)}`);
-  }
-  return result.runId;
+  const idempotencyKey = `sqlite-send-${randomUUID()}`;
+  return waitForAssertion(async () => {
+    const result = await client.request<{ runId?: string; status?: string }>(
+      "chat.send",
+      { sessionKey, message, idempotencyKey },
+      { timeoutMs: SQLITE_FLIP_PROOF_OPERATION_TIMEOUT_MS },
+    );
+    if (result?.status !== "started" || typeof result.runId !== "string") {
+      throw new Error(`chat.send did not start correctly: ${JSON.stringify(result)}`);
+    }
+    return result.runId;
+  });
 }
 
 async function waitForAgentRunOk(client: GatewayClient, runId: string): Promise<void> {
@@ -1841,7 +1830,7 @@ async function waitForHistoryRoleContains(
   await waitForAssertion(() => requireHistoryRoleContains(client, sessionKey, role, expected));
 }
 
-async function waitForAssertion(assertion: () => Promise<void>): Promise<void> {
+async function waitForAssertion<T>(assertion: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     try {
@@ -1850,7 +1839,7 @@ async function waitForAssertion(assertion: () => Promise<void>): Promise<void> {
       await sleep(50);
     }
   }
-  await assertion();
+  return assertion();
 }
 
 async function pollUntil<T>(

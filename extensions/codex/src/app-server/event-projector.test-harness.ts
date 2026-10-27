@@ -40,7 +40,6 @@ export { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
 
 export {
   CodexAppServerEventProjector,
-  createCodexTestModel,
   createCodexTestToolTerminalObserver,
   createMockPluginRegistry,
   describe,
@@ -127,6 +126,8 @@ export function registerCodexEventProjectorTestLifecycle(): void {
   });
 
   afterEach(async () => {
+    // Drain projected setImmediate hooks before a later test replaces their registry.
+    await flushDiagnosticEvents();
     resetAgentEventsForTest();
     resetDiagnosticEventsForTest();
     resetGlobalHookRunner();

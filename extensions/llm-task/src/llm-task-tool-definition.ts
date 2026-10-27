@@ -8,7 +8,7 @@ export const llmTaskToolDefinition = {
   name: "llm-task",
   label: "LLM Task",
   description:
-    "Run a JSON-only LLM task, or a bounded batch of independent inputs, and return schema-validated results. Batch failures are returned per item; no automatic retries.",
+    "Run a JSON-only LLM task, or a bounded batch of independent inputs, and return schema-validated results. Batch failures are returned per item; the batch scheduler adds no retries.",
   parameters: Type.Object({
     prompt: Type.String({ description: "Task instruction for the LLM." }),
     input: Type.Optional(Type.Unknown({ description: "Optional input payload for the task." })),
@@ -30,7 +30,9 @@ export const llmTaskToolDefinition = {
       }),
     ),
     schema: Type.Optional(
-      Type.Unknown({ description: "Optional JSON Schema to validate the returned JSON." }),
+      Type.Unknown({
+        description: "Optional JSON Schema to constrain and validate the returned JSON.",
+      }),
     ),
     provider: Type.Optional(
       Type.String({ description: "Provider override (e.g. openai, anthropic)." }),
