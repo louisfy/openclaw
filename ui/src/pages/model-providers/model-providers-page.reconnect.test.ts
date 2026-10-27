@@ -83,7 +83,7 @@ it.each([
     const page = appendPage(context);
     const row = await expandProvider(page, "xai");
     const reconnect = row.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect");
-    expect(reconnect?.disabled).toBe(false);
+    await waitForSolid(() => expect(reconnect?.disabled).toBe(false));
     reconnect!.click();
     await waitForSolid(() =>
       expect(page.querySelector<HTMLInputElement>('input[name="wizard-text"]')?.disabled).toBe(
@@ -150,7 +150,9 @@ it.each(["picker", "reconnect"] as const)(
       clickLoginChoice(page, "xAI oauth");
     } else {
       const row = await expandProvider(page, "xai");
-      row.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect")!.click();
+      const reconnect = row.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect");
+      await waitForSolid(() => expect(reconnect?.disabled).toBe(false));
+      reconnect!.click();
     }
     await waitForSolid(() =>
       expect(

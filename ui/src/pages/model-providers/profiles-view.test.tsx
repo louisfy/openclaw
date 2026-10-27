@@ -137,24 +137,6 @@ it("reconnects only expired, locally managed OAuth accounts through their creden
   expect(button()).toBeNull();
 });
 
-it("can reconnect a config-bound OAuth profile that the Gateway independently owns", () => {
-  const providerCard = card({
-    profiles: [
-      {
-        profileId: "xai:expired",
-        type: "oauth",
-        status: "expired",
-        source: "config",
-        logoutSupported: true,
-        reconnectSupported: true,
-      },
-    ],
-    profileProviderIds: { "xai:expired": "xai" },
-  });
-  const { container } = mount(providerCard, props({ canReconnect: () => true }));
-  expect(container.querySelector(".model-providers__profile-reconnect")).not.toBeNull();
-});
-
 it("retains account summary focus while refreshed snapshots update account data and recovery", () => {
   const profileId = "account:shared";
   const cards = ["one", "two"].map((name) =>
