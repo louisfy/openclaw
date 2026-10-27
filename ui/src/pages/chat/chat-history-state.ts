@@ -17,6 +17,7 @@ import { retirePullRequestRefreshes } from "./chat-pull-request-refresh.ts";
 import type { ChatHistorySessions, ChatState } from "./chat-state-contract.ts";
 import { readChatSessionProjectionScope, reduceChatSessionProjection } from "./history-merge.ts";
 import type { ChatHistoryRunObservation } from "./run-lifecycle.ts";
+import type { ChatSessionSnapshot } from "./session-message-cache.ts";
 
 export type InitialChatHistoryReceipt = {
   paramsKey: string;
@@ -79,6 +80,7 @@ type ChatHistoryPaneRequests = {
   subscriptionGeneration: number;
   pendingApprovalReplay?: { generation: number; events: Map<string, SessionApprovalEvent> };
   subscriptionReady?: Promise<boolean>;
+  openingSubscription?: { isCurrent: () => boolean; admit: () => void };
   subscriptionError?: string;
   subscriptionRetry?: AbortController;
   initialHistory?: InitialChatHistoryReceipt;
@@ -101,6 +103,8 @@ export type InitialChatSnapshotHydration = {
   titlePending?: boolean;
   sessionKey: string;
   connected: boolean;
+  readReadyHistory?: () => Pick<ChatSessionSnapshot, "deltaCursor" | "historyState"> | undefined;
+  adoptReadySnapshot?: () => Promise<void>;
   promise: Promise<void>;
 };
 

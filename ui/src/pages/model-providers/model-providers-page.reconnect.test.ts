@@ -2,9 +2,14 @@
 
 import { afterEach, expect, it, vi } from "vitest";
 import { waitForSolid } from "../../test-helpers/solid-settle.ts";
-import { loginHarness } from "./model-providers-page.login.test-support.ts";
+import {
+  loginHarness,
+  openPicker,
+  selectProvider,
+} from "./model-providers-page.login.test-support.ts";
 import {
   appendPage,
+  clickLoginChoice,
   createAuthStatus,
   expandProvider,
   submitCredential,
@@ -109,6 +114,49 @@ it.each([
       expect(page.querySelector('[data-profile-id="xai:restored"]')).not.toBeNull(),
     );
     expect(restoredRow.querySelector(".model-providers__profile-reconnect")).toBeNull();
+  },
+);
+
+it.each(["picker", "reconnect"] as const)(
+  "keeps the advertised provider logo in the %s sign-in dialog",
+  async (entry) => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const { context, request, answer } = reconnectHarness(["oauth"]);
+    const original = request.getMockImplementation()!;
+    let signInShown = false;
+    request.mockImplementation(async (method, ...args) => {
+      if (method === "wizard.next") {
+        if (signInShown) {
+          return answer.promise;
+        }
+        signInShown = true;
+        return {
+          done: false,
+          status: "running",
+          step: {
+            id: "browser-sign-in",
+            type: "progress",
+            executor: "gateway",
+            externalUrl: "https://example.invalid/authorize",
+          },
+        };
+      }
+      return original(method, ...args);
+    });
+    const page = appendPage(context);
+    if (entry === "picker") {
+      await openPicker(page);
+      await selectProvider(page, "xai");
+      clickLoginChoice(page, "xAI oauth");
+    } else {
+      const row = await expandProvider(page, "xai");
+      row.querySelector<HTMLButtonElement>(".model-providers__profile-reconnect")!.click();
+    }
+    await waitForSolid(() =>
+      expect(
+        page.querySelector('.wizard-sign-in__badge [data-provider-icon="grok"]'),
+      ).not.toBeNull(),
+    );
   },
 );
 

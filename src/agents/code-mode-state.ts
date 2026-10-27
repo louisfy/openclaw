@@ -299,7 +299,7 @@ function scheduleActiveRunExpiry(): void {
       Math.max(1, nextExpiresAt - performance.now()),
     ),
   );
-  activeRunExpiryTimer.unref?.();
+  activeRunExpiryTimer.unref();
 }
 
 export function removeExpiredRuns(now = Math.floor(performance.now())): void {

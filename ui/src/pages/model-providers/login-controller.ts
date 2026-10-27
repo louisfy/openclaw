@@ -23,7 +23,6 @@ import {
   buildLoginProviders,
   resolveLoginSelection,
   resolveReconnectChoice,
-  resolveLoginCompletionModel,
   type LoginChoice,
 } from "./login-providers.ts";
 import { createModelProviderStartChat } from "./login-start-chat.ts";
@@ -217,10 +216,9 @@ export function createModelProviderLogin(options: {
     const selectingModel = allowSetup && selected.requiresSetup;
     loginMode = selectingModel ? "activate" : selected.requiresSetup ? "access" : "auth";
     refreshWarning = null;
-    runner.prepareSignIn(selected.kind, selected.label);
-    void run(() =>
-      runner.start(selected.id, "models.authLogin", selectingModel ? { selectModel: true } : {}),
-    );
+    runner.prepareSignIn(selected.kind, selected.label, selected.brandId);
+    const activation: { selectModel?: true } = selectingModel ? { selectModel: true } : {};
+    void run(() => runner.start(selected.id, "models.authLogin", activation));
   }
 
   async function open(
@@ -484,13 +482,27 @@ export function createModelProviderLogin(options: {
       return;
     }
     const { context, agentId } = options.getScope();
+    const catalog = readAgentModelCatalog(context.gateway.snapshot.client, agentId);
+    const slash = modelRef.indexOf("/");
+    const provider = modelRef.slice(0, slash);
+    const id = modelRef.slice(slash + 1);
+    const known = catalog.models.find((model) => model.provider === provider && model.id === id);
     verifiedModelRef = modelRef;
-    completionModel = resolveLoginCompletionModel(
-      readAgentModelCatalog(context.gateway.snapshot.client, agentId),
-      modelRef,
-      authProviderId,
-      completion.modelActivation?.modelName,
-    );
+    const recommended =
+      !catalog.retired &&
+      catalog.models.find(
+        (model) =>
+          canonicalModelAuthProviderId(model.provider) === authProviderId &&
+          model.available === true &&
+          model.manualSelectionAllowed !== false &&
+          model.recommended === true,
+      );
+    const name = completion.modelActivation?.modelName ?? known?.name;
+    completionModel = recommended
+      ? { provider: recommended.provider, id: recommended.id, name: recommended.name }
+      : name
+        ? { provider, id, name }
+        : undefined;
     notify();
   }
 
@@ -665,8 +677,7 @@ export function createModelProviderLogin(options: {
         onConnect: (card: ModelProviderCard) => open([card.id, ...card.credentialProviderIds]),
         canConnect: (card: ModelProviderCard) =>
           loginProviders([card.id, ...card.credentialProviderIds]).length > 0,
-        canReconnect: (provider: string) =>
-          Boolean(resolveReconnectChoice(loginProviders([provider]))),
+        canReconnect: (id: string) => resolveReconnectChoice(loginProviders([id])) !== undefined,
         reconnectDisabled: !options.canStart() || busy(),
         onReconnect: (provider: string) => {
           const choice = resolveReconnectChoice(loginProviders([provider]));

@@ -1,6 +1,7 @@
 import { createSignal } from "solid-js";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { page, server, userEvent } from "vitest/browser";
+import { createSessionGoalFixture } from "../../../../src/gateway/session-goal.test-support.js";
 import type { SessionGoal } from "../../api/types.ts";
 import { ContentPresentation } from "../../lib/solid/presentation.ts";
 import { cleanupSolid, mountSolid } from "../../test-helpers/mount-solid.ts";
@@ -16,7 +17,6 @@ import { AttachmentPreview } from "./components/chat-attachments.tsx";
 import { ChatGoal } from "./components/chat-composer-goal.tsx";
 import { makeCapabilities } from "./components/chat-composer-menu.test-support.ts";
 import { ComposerMenu } from "./components/chat-composer-menu.tsx";
-import { resetChatComposerState } from "./components/chat-composer-state.ts";
 import "../../styles/base.css";
 import "../../styles/components.css";
 import "../../styles/chat/composer.css";
@@ -24,6 +24,7 @@ import "../../styles/chat/composer-surface.css";
 import "../../styles/chat/composer-context-strip.css";
 import "../../styles/chat/composer-progress.css";
 import "../../styles/chat/composer-queue.css";
+import { resetChatComposerState } from "./components/chat-composer-state.ts";
 
 const attachments = Array.from({ length: 7 }, (_, index) => ({
   id: `overflow-${index}`,
@@ -112,13 +113,10 @@ it.each([390, 2048])("fits skill rows at %ipx", async (width) => {
   await afterLayout();
   const dropdown = query(".agent-chat__capability-menu");
   const menu = query(".oc-menu", dropdown);
-  expect(menu.scrollHeight).toBeGreaterThan(menu.clientHeight);
+  const scroll = query(".agent-chat__capability-menu-scroll", menu);
+  expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
   for (const row of dropdown.querySelectorAll<HTMLElement>('[data-value^="skill:"]')) {
-    expectInside(
-      rect(".agent-chat__capability-menu-label", row),
-      row.getBoundingClientRect(),
-      true,
-    );
+    expectInside(rect(".oc-menu-item__label", row), row.getBoundingClientRect(), true);
   }
   expect(menu.scrollWidth).toBeLessThanOrEqual(menu.clientWidth);
   expect(menu.getBoundingClientRect().right).toBeLessThanOrEqual(width);
@@ -332,6 +330,19 @@ it.each([
 
   const emptyHeight = textarea.clientHeight;
   await expectStableSize("A short editable draft.");
+  const textWidth = () => {
+    const style = getComputedStyle(textarea);
+    return (
+      textarea.clientWidth -
+      Number.parseFloat(style.paddingLeft) -
+      Number.parseFloat(style.paddingRight)
+    );
+  };
+  const shortTextWidth = textWidth();
+  const hasClassicScrollbar = CSS.supports("selector(::-webkit-scrollbar)");
+  if (hasClassicScrollbar) {
+    expect(getComputedStyle(textarea).scrollbarGutter).toBe("auto");
+  }
   const draft =
     "A typed line that wraps within the available composer width. ".repeat(12) +
     "\nA second editable line.";
@@ -346,6 +357,10 @@ it.each([
     0,
   );
   expect(textarea.scrollWidth).toBeLessThanOrEqual(textarea.clientWidth + 1);
+  expect(textWidth()).toBeCloseTo(shortTextWidth, 0);
+  if (hasClassicScrollbar) {
+    expect(getComputedStyle(textarea).scrollbarGutter).toBe("stable");
+  }
   await expectStableSize(`${draft}\nAnother line in the capped draft.`);
 
   await control.fill("");
@@ -353,6 +368,10 @@ it.each([
   expect(document.activeElement).toBe(textarea);
   expect(placeholder.checkVisibility()).toBe(true);
   expect(textarea.clientHeight).toBe(emptyHeight);
+  expect(textWidth()).toBeCloseTo(shortTextWidth, 0);
+  if (hasClassicScrollbar) {
+    expect(getComputedStyle(textarea).scrollbarGutter).toBe("auto");
+  }
 });
 
 it.each([
@@ -361,18 +380,12 @@ it.each([
 ] as const)("lays out expanded goal controls at %ipx (%s)", async (width, status) => {
   await resize(width, "agent-chat__composer-shell", 800);
   const [expanded, setExpanded] = createSignal(false);
-  const goal: SessionGoal = {
-    schemaVersion: 1,
-    id: "overflow-goal",
-    objective: "Short objective",
+  const goal: SessionGoal = createSessionGoalFixture("overflow-goal", "Short objective", {
     status,
     lastStatusNote: "Review the deployment results before continuing.",
     createdAt: 1000,
     updatedAt: 2000,
-    tokenStart: 0,
-    tokensUsed: 0,
-    continuationTurns: 0,
-  };
+  });
   const [currentGoal, setGoal] = createSignal(goal, { equals: false });
   const drawObjective = (objective: string) => {
     goal.objective = objective;

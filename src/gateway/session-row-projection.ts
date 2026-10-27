@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { listAgentIds } from "../agents/agent-scope-config.js";
 import type { readPreparedSessionEntryChange } from "../config/sessions/session-accessor.sqlite-entry-cache-publication.js";
 import { isIncognitoSessionKey } from "../routing/session-key.js";
 import {
@@ -225,14 +224,7 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
   const lookup = (query: records.Lookup) =>
     disposed
       ? undefined
-      : rowReads.lookupSessionRow(query, {
-          cfg,
-          rows,
-          byKey,
-          scope,
-          stores,
-          assertCurrent: assertActive,
-        });
+      : rowReads.lookupSessionRow(query, cfg, rows, byKey, scope, stores, assertActive);
   function referenced(ref: string) {
     return records.firstReferenced(ref, rows, byKey, stores.keys());
   }
@@ -320,8 +312,12 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     }
     epoch++;
     const identityRevision = metadata.current.identityProjection?.revision;
-    const presentationOnly = metadata.invalidate(change) && !change.factsInvalidated;
     const catalogOnly = "all" in change && change.scope === "catalog" && !change.factsInvalidated;
+    // Catalog adoption invalidates model facts only when its completed policy changes.
+    const presentationOnly =
+      !(catalogOnly && params.getModelCatalog) &&
+      metadata.invalidate(change) &&
+      !change.factsInvalidated;
     revisions.publishRuntimeChange(change);
     if (!presentationOnly || metadata.current.identityProjection?.revision !== identityRevision) {
       revisions.invalidate(!catalogOnly);
@@ -364,7 +360,7 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
           if (change.scope === "transcript" || change.factsInvalidated === true) {
             backfill.remove(records.identity(row));
           }
-          markStoredRow(row, change, prepared);
+          revisions.withChangeScope(change.scope, () => markStoredRow(row, change, prepared));
         },
       });
     }
@@ -389,7 +385,6 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     });
   function materialize(
     row: records.Row,
-    configuredAgentIds = new Set(listAgentIds(cfg)),
     readRow = rowReads.readResidentSessionRow,
     preparedDatabaseFacts?: records.PreparedSessionRowDatabaseFacts,
     repositoryWorkspace?: records.Inputs["preparedRepositoryWorkspace"],
@@ -409,7 +404,8 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
         : (membership.membership(row.storeTarget.storePath, row.key) ?? []),
       cfg,
       modelCatalog: catalog.current,
-      configuredAgentIds,
+      configuredAgentIds: metadata.configuredAgentIds,
+      revisions: metadata.materializedRevisions,
       context: metadata.current,
       subagentInputs: metadata.subagentInputs,
       gatewayContext: params.context,
@@ -535,8 +531,7 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     refresh,
     describeArchived: (row) => archive.describe(row),
     isCurrent,
-    materializePrivate: (row, repository) =>
-      materialize(row, undefined, undefined, undefined, repository),
+    materializePrivate: (row, repository) => materialize(row, undefined, undefined, repository),
     preparePresentation(row) {
       if (row.materialized.source.cfg !== cfg) {
         row.materialized = replaceSessionRowFacts(row.materialized, undefined, { cfg });
@@ -632,6 +627,8 @@ export async function createSessionRowProjection(params: records.ProjectionOptio
     onSelectionChange: revisions.onSelectionChange,
     onFactsChange: revisions.onFactsChange,
     readTaskPublicationRevision: revisions.taskPublication,
+    hasLogicalChildEntries: (parent: Pick<records.Row, "agentId" | "key">) =>
+      byParent.has(records.logicalSessionRowIdentity(parent.agentId, parent.key)),
     get physicalPaths() {
       return scope.physicalPaths;
     },

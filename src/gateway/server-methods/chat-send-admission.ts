@@ -2,10 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isFutureDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { readAcpSessionMetaForEntries } from "../../acp/runtime/session-meta-readonly.js";
-import {
-  createAgentRunRestartAbortError,
-  isAgentRunDirectAbortReason,
-} from "../../agents/run-termination.js";
+import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { resolveQueueSettings } from "../../auto-reply/reply/queue/settings-runtime.js";
 import { resolveSessionWorkStartError } from "../../config/sessions.js";
 import { SESSION_ROUTING_CHANGED_ERROR_REASON } from "../../config/sessions/main-session.js";
@@ -266,13 +263,16 @@ export async function admitChatSend(params: ChatSendAdmissionParams) {
       placementService &&
       preparedPlacement?.sessionId !== admittedSessionId
     ) {
-      return withRestartSafeChatPlacement(placementService, admittedSessionId, (prepared) =>
-        commitChatWorkAdmission(acpMeta, prepared),
-      );
+      using placementPhase = diagnostics?.scope("detail.admission.placement_prepare");
+      return await withRestartSafeChatPlacement(placementService, admittedSessionId, (prepared) => {
+        placementPhase?.finish();
+        return commitChatWorkAdmission(acpMeta, prepared);
+      });
     }
     let refreshPlacement = false;
     for (;;) {
       let pendingPlacementRead: (() => Promise<void>) | undefined;
+      using currentPhase = diagnostics?.scope("detail.admission.current_session");
       await withCurrentChatSendRetry(params, pendingAttemptId, (latestSession, comparison) => {
         const currentConfig = context.getRuntimeConfig();
         const localRecovery = restartSafeRequest && !currentConfig.cloudWorkers?.requiredProfile;
@@ -417,6 +417,7 @@ export async function admitChatSend(params: ChatSendAdmissionParams) {
         break;
       }
       // End row consumption before joining the native writer; retain FIFO and recheck authority.
+      currentPhase?.mark("detail.admission.placement_refresh");
       await pendingPlacementRead();
     }
     return refreshPlacement ? commitChatWorkAdmission(acpMeta) : undefined;
@@ -428,6 +429,7 @@ export async function admitChatSend(params: ChatSendAdmissionParams) {
   let retainedRequestConflict: ReturnType<typeof resolveChatSendRequestConflict>;
   try {
     using workPhase = diagnostics?.scope("detail.admission.work");
+    using admissionPhase = diagnostics?.scope("detail.admission.operator");
     const preparedInterrupt = await prepareChatSendInterruptAdmission({
       operator: { ...params, runId: clientRunId, spawnedBy: session.entry?.spawnedBy },
       interruptCapture: runInterruptCapture,
@@ -438,6 +440,7 @@ export async function admitChatSend(params: ChatSendAdmissionParams) {
     });
     capturedOperator = preparedInterrupt.operator;
     releaseCapturedOperator = capturedOperator.release;
+    admissionPhase?.mark("detail.admission.lifecycle_prepare");
     gatewayWorkAdmission = await beginSessionEffect({
       agentId,
       sourceInput: admittedRunAbort.entry?.input,
@@ -450,31 +453,28 @@ export async function admitChatSend(params: ChatSendAdmissionParams) {
         assertChatSendExclusiveAdmission(request, session);
       },
       revalidateAllowed: async () => {
+        admissionPhase?.finish();
         using _ = diagnostics?.scope("detail.admission.revalidate");
         if (!restartSafeRequest) {
           return await commitChatWorkAdmission(null);
         }
+        using preparationPhase = diagnostics?.scope("detail.admission.session_read");
         const latest = await withCurrentChatSendSession({
           session,
           getRuntimeConfig: context.getRuntimeConfig,
           includeMembership: false,
           consume: (current) => current,
         });
+        preparationPhase?.mark("detail.admission.acp_metadata");
         const [acpMeta] = await readAcpSessionMetaForEntries({
           cfg: latest.cfg,
           entries: [{ agentId, sessionKey: latest.canonicalKey, entry: latest.entry }],
         });
+        preparationPhase?.finish();
         return await commitChatWorkAdmission(acpMeta ?? null);
       },
       onInterrupt: (reason) => {
-        const stopReason = isAgentRunDirectAbortReason(reason) ? "rpc" : "restart";
-        if (!admittedRunAbort.controller.signal.aborted) {
-          // A later lifecycle drain must not overwrite the first abort reason.
-          if (admittedRunAbort.entry) {
-            admittedRunAbort.entry.adapter.abortStopReason = stopReason;
-          }
-          admittedRunAbort.controller.abort(reason);
-        }
+        admittedRunAbort.controller.abort(reason);
       },
     });
     if (workerGoalAdmission && !capturedOperator.authority) {

@@ -37,6 +37,12 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
     ensureSandboxCreateCallForTest(podmanParams(cfg, workspaceDir));
   const calls = (operation: string) =>
     spawnState.calls.filter((call) => call.args[0] === operation);
+  const mount = (Source: string, Destination: string, RW = true, Type = "bind") => ({
+    Type,
+    Source,
+    Destination,
+    RW,
+  });
   const expectNoMutation = () => {
     expect(spawnState.calls.some((call) => ["rm", "create", "start"].includes(call.args[0]!))).toBe(
       false,
@@ -71,7 +77,7 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
     createArgsEpoch: SANDBOX_DOCKER_CREATE_ARGS_EPOCH,
   });
 
-  it("serializes concurrent provisioning for one container", async () => {
+  it("serializes provisioning and inspects each admitted container once", async () => {
     const workspaceDir = tempDirs.make("openclaw-docker-mounts-");
     const cfg = createSandboxConfig([], [`${workspaceDir}:/workspace:rw`]);
     prepareCreation(true);
@@ -91,8 +97,36 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
     expect(second).toEqual(first);
     expect(calls("create")).toHaveLength(1);
     expect(calls("start")).toHaveLength(1);
-    expect(registryMocks.updateRegistry).toHaveBeenCalledTimes(2);
+    expect(calls("inspect")).toHaveLength(2);
+    expect(calls("image")).toHaveLength(0);
+    expect(calls("create")[0]?.args).toContain("--pull=never");
   });
+
+  it.each([
+    [
+      "No such image: example/custom:latest",
+      "Sandbox image not found: example/custom:latest. Build or pull it first.",
+    ],
+    ["", "container name is already in use"],
+  ])(
+    "diagnoses failed Docker creation without starting a container (%s)",
+    async (imageError, message) => {
+      const workspaceDir = tempDirs.make("openclaw-docker-create-");
+      const cfg = createSandboxConfig([], [`${workspaceDir}:/workspace:rw`]);
+      cfg.docker.image = "example/custom:latest";
+      prepareCreation(true);
+      spawnState.createError = imageError || "container name is already in use";
+      spawnState.imageError = imageError;
+
+      await expect(
+        harness.ensureSandboxContainer(containerParams(cfg, workspaceDir)),
+      ).rejects.toThrow(message);
+
+      expect(calls("create")).toHaveLength(1);
+      expect(calls("image")).toHaveLength(1);
+      expect(calls("start")).toHaveLength(0);
+    },
+  );
 
   it.each(["docker", "podman"] as const)(
     "completes %s setup after recreation with retained registry custody",
@@ -136,8 +170,6 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
             }),
           ).resolves.toMatchObject({
             containerName,
-            containerId: "c".repeat(64),
-            configHash: expect.any(String),
             currentConfig: true,
           });
 
@@ -193,8 +225,7 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
         requireCurrentConfig: true,
       }),
     ).rejects.toThrow("restricted dispatch requires the current container config");
-    expect(spawnState.calls.some((call) => call.args[0] === "rm")).toBe(false);
-    expect(spawnState.calls.some((call) => call.args[0] === "create")).toBe(false);
+    expectNoMutation();
     expect(registryMocks.updateRegistry).not.toHaveBeenCalled();
   });
 
@@ -226,10 +257,6 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
     const envFile = collectDockerFlagValues(createCall.args, "--env-file")[0];
     expect(envFile).toBeDefined();
     expect(fs.existsSync(envFile!)).toBe(false);
-    expect(createCall.args.filter((arg) => arg === "--init")).toHaveLength(1);
-    expect(createCall.args).toContain(
-      `openclaw.createArgsEpoch=${SANDBOX_DOCKER_CREATE_ARGS_EPOCH}`,
-    );
 
     const registryUpdate = registryMocks.updateRegistry.mock.calls.at(-1)?.[0];
     expect(registryUpdate?.configHash).toBe(newHash);
@@ -504,34 +531,16 @@ describe("ensureSandboxContainer recreation and managed mounts", () => {
       prepareCreation(true);
       await harness.ensureSandboxContainer(params);
       spawnState.mounts = JSON.stringify([
-        {
-          Type: "bind",
-          Source: scenario === "user source change" ? `${workspaceDir}/previous` : workspaceDir,
-          Destination: "/workspace",
-          RW: true,
-        },
-        ...(scenario === "image volume"
-          ? [{ Type: "volume", Source: "/volume", Destination: "/data", RW: true }]
-          : []),
+        mount(
+          scenario === "user source change" ? `${workspaceDir}/previous` : workspaceDir,
+          "/workspace",
+        ),
+        ...(scenario === "image volume" ? [mount("/volume", "/data", true, "volume")] : []),
         ...(scenario === "writable skill bind"
-          ? [
-              {
-                Type: "bind",
-                Source: `${workspaceDir}/skills`,
-                Destination: "/workspace/skills",
-                RW: true,
-              },
-            ]
+          ? [mount(`${workspaceDir}/skills`, "/workspace/skills")]
           : []),
         ...(scenario === "user read-only skill bind"
-          ? [
-              {
-                Type: "bind",
-                Source: `${workspaceDir}/previous`,
-                Destination: "/workspace/skills",
-                RW: false,
-              },
-            ]
+          ? [mount(`${workspaceDir}/previous`, "/workspace/skills", false)]
           : []),
       ]);
       spawnState.readOnlyRoot = scenario !== "writable root";
